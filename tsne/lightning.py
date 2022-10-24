@@ -1,14 +1,11 @@
+import argparse
+import pytorch_lightning as pl
+import torch.nn as nn
 import torch
-from torch import nn
+import numpy as np
 from torch.utils.data import DataLoader, random_split, TensorDataset
 import torch.optim as optim
-import math
-import argparse
-from torchvision import datasets
-from torchvision.transforms import ToTensor
 from tqdm import tqdm
-import matplotlib.pyplot as plt
-import numpy as np
 
 
 def Hbeta(D: torch.Tensor, beta: float) -> tuple:
@@ -71,17 +68,16 @@ def x2p(
 class NeuralNetwork(nn.Module):
     def __init__(self) -> None:
         super(NeuralNetwork, self).__init__()
-        # self.flatten = nn.Flatten()
         self.linear_relu_stack = nn.Sequential(
             nn.Linear(32, 24),
             nn.ReLU(),
             nn.Linear(24, 24),
             nn.ReLU(),
             nn.Linear(24, 2),
+            nn.LogSoftmax(dim=1),
         )
 
     def forward(self, x):
-        # x = self.flatten(x)
         logits = self.linear_relu_stack(x)
         return logits
 
@@ -140,7 +136,7 @@ class ParametericTSNE:
 
     def fit(self, dataloader: torch.utils.data.DataLoader):  # type: ignore
         size = len(dataloader.dataset)
-        P = self.__calculate_P(dataloader)
+        P = self._calculate_P(dataloader)
 
         epoch = 0
         while epoch < self.max_iterations:
@@ -254,7 +250,7 @@ class ParametericTSNE:
 
         return train_loader, test_loader
 
-    def __calculate_P(self, dataloader: torch.utils.data.DataLoader) -> torch.Tensor:
+    def _calculate_P(self, dataloader: torch.utils.data.DataLoader) -> torch.Tensor:
         n = len(dataloader.dataset)
         P = torch.zeros((n, self.batch_size), device=self.__device)
         for i, (X, *_) in tqdm(
@@ -287,6 +283,47 @@ class ParametericTSNE:
             if y.shape[0] % self.batch_size != 0:
                 y = y[: -(y.shape[0] % self.batch_size)]
         return X, y
+
+
+class Classifier(pl.LightningModule):
+    def __init__(self, tsne: ParametericTSNE):
+        super().__init__()
+        self.tsne = tsne
+        self.batch_size = tsne.batch_size
+        self.model = self.tsne.model
+        self.loss_fn = nn.KLDivLoss(reduction="batchmean")
+
+    def training_step(self, batch, batch_idx):
+        x = batch[0]
+        y = self.P_copy[batch_idx * self.batch_size : (batch_idx + 1) * self.batch_size]
+        logits = self.model(x)
+        loss = self.loss_fn(logits, y)
+        self.log(
+            "train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True
+        )
+        return loss
+
+    # def validation_step(self, batch, batch_idx):
+    #     x = batch
+    #     y = self.P_copy[batch_idx * self.batch_size : (batch_idx + 1) * self.batch_size]
+    #     logits = self.model(x)
+    #     loss = self.loss_fn(logits, y)
+    #     self.log("val_loss", loss)
+
+    def configure_optimizers(self):
+        return self.tsne.optimizer
+
+    def on_train_start(self) -> None:
+        self.P = self.tsne._calculate_P(self.trainer.train_dataloader)
+
+    def on_train_epoch_start(self) -> None:
+        self.P_copy = self.P.clone()
+
+    def on_train_epoch_end(self) -> None:
+        del self.P_copy
+
+    def predict_step(self, batch, batch_idx, dataloader_idx=None):
+        return self.model(batch[0])
 
 
 class FileTypeWithExtensionCheck(argparse.FileType):
@@ -367,9 +404,11 @@ if __name__ == "__main__":
             "-1",
             "0",
             "-step",
-            "50",
+            "100",
             "-iter",
             "25",
+            "-o",
+            "lightning.txt"
             # "-model",
             # "model.pth",
         ]
@@ -426,13 +465,24 @@ if __name__ == "__main__":
         Y = tsne.transform(test)
     else:
         train, test = tsne.split_dataset(data, train_size=0.8)
-        tsne.fit(train)
+        model = NeuralNetwork()
+        classifier = Classifier(tsne)
+        trainer = pl.Trainer(
+            accelerator="gpu",
+            devices=1,
+            log_every_n_steps=1,
+            max_epochs=args.iter,
+        )
+        trainer.fit(classifier, train)
+        # tsne.fit(train)
         tsne.save_model("model.pth")
-        Y = tsne.transform(test)
+        Y = trainer.predict(classifier, test)
 
     with open(args.o, "w") as f:
         f.writelines(f"{args.step}\n")
-        for data in range(Y.shape[0]):
-            f.writelines(f"{Y[data, 0]}\t{Y[data, 1]}\n")
+        for i, (X, y) in tqdm(enumerate(Y), units="samples", total=len(Y)):
+            zip_data = zip(X, y)
+            for x, y in zip_data:
+                f.writelines(f"{x}\t{y}\n")
     # plt.scatter(Y[:, 0], Y[:, 1], 20, labels)
     # plt.show()
