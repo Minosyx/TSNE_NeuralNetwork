@@ -6,6 +6,7 @@ import numpy as np
 import torch
 import torch.optim as optim
 from torch import flatten, nn
+import pytorch_lightning as pl
 from torch.utils.data import DataLoader, TensorDataset, random_split
 from torchvision import datasets
 from torchvision.transforms import ToTensor, Compose, Lambda
@@ -52,19 +53,20 @@ def x2p_job(data: tuple, tolerance: float, max_iterations: int = 50) -> tuple:
 
 
 def x2p(
-    X: torch.Tensor, perplexity: int, tolerance: float, n_jobs: int
+    X: torch.Tensor,
+    perplexity: int,
+    tolerance: float,
 ) -> torch.Tensor:
     n = X.shape[0]
-    logU = torch.log(torch.tensor(perplexity, device=X.device))
+    logU = torch.log(torch.tensor([perplexity], device=X.device))
 
-    sum_X = torch.sum(torch.square(X), 1)
-    second = sum_X.reshape((-1, 1)) - 2 * torch.matmul(X, X.mT)
-    D = sum_X + second
+    sum_X = torch.sum(torch.square(X), dim=1)
+    D = torch.add(torch.add(-2 * torch.mm(X, X.mT), sum_X).T, sum_X)
 
     idx = (1 - torch.eye(n)).type(torch.bool)
     D = D[idx].reshape((n, -1))
 
-    P = torch.zeros((n, n))
+    P = torch.zeros(n, n)
 
     for i in range(n):
         P[i, idx[i]] = x2p_job((i, D[i], logU), tolerance)[1]
@@ -142,81 +144,6 @@ class ParametericTSNE:
         self.model.load_state_dict(torch.load(filename))
         self.model = self.model.to(self.device)
 
-    def fit(self, dataloader: torch.utils.data.DataLoader):  # type: ignore
-        size = len(dataloader.dataset)
-        P = self.__calculate_P(dataloader)
-
-        epoch = 0
-        while epoch < self.max_iterations:
-            train_loss = 0
-            epoch += 1
-            print(f"Epoch {epoch}/{self.max_iterations}")
-            P_copy = P.clone()
-
-            if epoch < self.early_exaggeration_epochs:
-                P_copy *= self.early_exaggeration_value
-
-            self.model.train()
-            for i, (X, *y) in tqdm(
-                enumerate(dataloader), unit="batch", total=len(dataloader)
-            ):
-                X = X.to(self.device)
-                if len(y) > 0:
-                    y = y[0].to(self.device)
-                self.optimizer.zero_grad()
-
-                y_pred = self.model(X)
-
-                loss = self.loss_fn(
-                    y_pred, P_copy[i * self.batch_size : (i + 1) * self.batch_size]
-                )
-                loss.backward()
-                self.optimizer.step()
-
-                train_loss += loss.item()
-
-            train_loss /= size
-            tqdm.write(f"Loss: {train_loss:>8f}")
-            del P_copy
-        return self
-
-    def transform(self, dataloader):
-        self.model.eval()
-        i = 0
-        results = np.empty(shape=(0, self.n_components))
-        with torch.no_grad():
-            for X, *y in dataloader:
-                X = X.to(self.device)
-                X_new = self.model(X)
-                results = np.append(results, X_new.cpu().detach().numpy(), axis=0)
-                i += 1
-        return results
-
-    def fit_transform(self, dataloader: torch.utils.data.DataLoader):  # type: ignore
-        self.fit(dataloader)
-        X_new = self.transform(dataloader)
-        return X_new
-
-    def test(self, dataloader: torch.utils.data.DataLoader):  # type: ignore
-        size = len(dataloader.dataset)
-        num_batches = len(dataloader)
-        self.model.eval()
-        test_loss, correct = 0, 0
-        with torch.no_grad():
-            for X, *y in dataloader:
-                X = X.to(self.device)
-                if len(y) > 0:
-                    y = y[0].to(self.device)
-                pred = self.model(X)
-                loss = self.loss_fn(pred, y)
-                test_loss += loss.item()
-                correct += (pred.argmax(1) == y).type(torch.float).sum().item()
-        test_loss /= num_batches
-        correct /= size
-        print(
-            f"Test Error: \n Accuracy: {(100*correct):>0.1f}%, Avg loss: {test_loss:>8f} \n)"
-        )
-
     def split_dataset(self, X, y=None, train_size=None, test_size=None):
         if train_size is None and test_size is None:
             train_size = 0.8
@@ -236,7 +163,6 @@ class ParametericTSNE:
             train_loader = DataLoader(
                 train_dataset,
                 batch_size=self.batch_size,
-                shuffle=True,
                 drop_last=True,
                 num_workers=self.n_jobs,
             )
@@ -254,13 +180,13 @@ class ParametericTSNE:
 
         return train_loader, test_loader
 
-    def __calculate_P(self, dataloader: torch.utils.data.DataLoader) -> torch.Tensor:
+    def _calculate_P(self, dataloader: torch.utils.data.DataLoader) -> torch.Tensor:
         n = len(dataloader.dataset)
         P = torch.zeros((n, self.batch_size), device=self.device)
         for i, (X, *_) in tqdm(
-            enumerate(dataloader), unit="batch", total=len(dataloader)
+            enumerate(dataloader), unit="batches", total=len(dataloader)
         ):
-            batch = x2p(X, self.perplexity, self.tolerance, self.n_jobs)
+            batch = x2p(X, self.perplexity, self.tolerance)
             batch[torch.isnan(batch)] = 0
             batch = batch + batch.T
             batch = batch / batch.sum()
@@ -279,6 +205,48 @@ class ParametericTSNE:
         C = torch.log((P + eps) / (Q + eps))
         C = torch.sum(P * C)
         return C
+
+
+class Classifier(pl.LightningModule):
+    def __init__(self, tsne: ParametericTSNE):
+        super().__init__()
+        self.tsne = tsne
+        self.batch_size = tsne.batch_size
+        self.model = self.tsne.model
+        self.loss_fn = tsne.loss_fn
+
+    def training_step(self, batch, batch_idx):
+        x = batch[0]
+
+        p_idxs = torch.randperm(x.shape[0])
+        x = x[p_idxs]
+        _P_batch = self.P_copy[
+            batch_idx * self.batch_size : (batch_idx + 1) * self.batch_size
+        ]
+        _P_batch = _P_batch[p_idxs, :]
+        _P_batch = _P_batch[:, p_idxs]
+
+        logits = self.model(x)
+        loss = self.loss_fn(logits, _P_batch)
+        self.log(
+            "train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True
+        )
+        return loss
+
+    def configure_optimizers(self):
+        return self.tsne.optimizer
+
+    def on_train_start(self) -> None:
+        self.P = self.tsne._calculate_P(self.trainer.train_dataloader)
+
+    def on_train_epoch_start(self) -> None:
+        self.P_copy = self.P.clone()
+
+    def on_train_epoch_end(self) -> None:
+        del self.P_copy
+
+    def predict_step(self, batch, batch_idx, dataloader_idx=None):
+        return self.model(batch[0])
 
 
 class FileTypeWithExtensionCheck(argparse.FileType):
@@ -339,15 +307,11 @@ if __name__ == "__main__":
         required=False,
         default=0,
     )
-    # parser.add_argument('-max_rows', type=int, help='Number of rows to read', required=False)
-    # parser.add_argument('-skip_rows', type=int, help='Number of rows to skip', default=0, required=False)
     parser.add_argument(
         "-o", type=str, help="Output filename", required=False, default="result.txt"
     )
     parser.add_argument("-model", type=str, help="Model filename", required=False)
 
-    # print("Run Y = tsne.tsne(X, no_dims, perplexity) to perform t-SNE on your dataset.")
-    # print("Running example on 2,500 MNIST digits...")
     args = parser.parse_args(
         [
             "tsne/colvar-tf.data",
@@ -361,43 +325,13 @@ if __name__ == "__main__":
             "-step",
             "50",
             "-iter",
-            "25",
+            "200",
+            "-o",
+            "mnist.txt"
             # "-model",
             # "model.pth",
         ]
     )
-    # labels = None
-    # if args.labels:
-    #     labels = np.loadtxt(args.labels)
-    #     args.labels.close()
-
-    # cols = None
-    # if args.exclude_cols:
-    #     args.input_file.readline()
-    #     last_pos = args.input_file.tell()
-    #     ncols = len(args.input_file.readline().strip().split(" "))
-    #     args.input_file.seek(last_pos)
-    #     cols = np.arange(0, ncols, 1)
-    #     cols = tuple(np.delete(cols, args.exclude_cols))
-
-    # # X = np.loadtxt(args.input_file, usecols=cols, max_rows=args.max_rows, skiprows=args.skip_rows)
-    # X = np.loadtxt(args.input_file, usecols=cols)
-
-    # args.input_file.close()
-
-    # data = np.array(X[:: args.step, :])
-
-    # means = data.mean(axis=0)
-    # vars = data.var(axis=0)
-
-    # with open("means_and_vars.txt", "w") as f:
-    #     f.writelines("column\tmean\tvar\n")
-    #     for v in range(len(means)):
-    #         # print(f"Column {v} mean: {means[v]}, var: {vars[v]}")
-    #         f.writelines(f"{v}\t{means[v]}\t{vars[v]}\n")
-
-    # data = torch.from_numpy(data).float()
-    # loss_fn = torch.nn.KLDivLoss(reduction="batchmean")
     training_data = datasets.FashionMNIST(
         root="data",
         train=True,
@@ -412,14 +346,15 @@ if __name__ == "__main__":
         transform=Compose([ToTensor(), Lambda(flatten)]),
     )
 
-    batch_size = 64
+    batch_size = 1024
 
     train = DataLoader(
         training_data,
         batch_size=batch_size,
         drop_last=True,
+        pin_memory=True,
     )
-    test = DataLoader(test_data, batch_size=batch_size, drop_last=True)
+    test = DataLoader(test_data, batch_size=batch_size, drop_last=True, pin_memory=True)
 
     for X, y in test:
         print(f"Shape of X [N, C, H, W]: {X.shape}")
@@ -432,51 +367,34 @@ if __name__ == "__main__":
         {"lr": 1e-3},
         args.no_dims,
         args.perplexity,
-        64,
+        batch_size,
         0,
         0,
         args.iter,
         5,
     )
 
+    trainer = pl.Trainer(
+        accelerator="gpu",
+        devices=1,
+        log_every_n_steps=1,
+        max_epochs=args.iter,
+    )
+    classifier = Classifier(tsne)
+
     if args.model:
         tsne.read_model(args.model)
-        # train, test = tsne.split_dataset(data, test_size=1)
-        Y = tsne.transform(test)
+        Y = trainer.predict(test)
     else:
-        # train, test = tsne.split_dataset(data, train_size=0.8)
-        tsne.fit(train)
-        tsne.save_model("model.pth")
-        Y = tsne.transform(test)
+        trainer.fit(classifier, train)
+        tsne.save_model("mnist.pth")
+        Y = trainer.predict(classifier, test)
 
     with open(args.o, "w") as f:
-        f.writelines(f"{args.step}\n")
-        for data in range(Y.shape[0]):
-            f.writelines(f"{Y[data, 0]}\t{Y[data, 1]}\n")
+        for i, batch in tqdm(enumerate(Y), unit="samples", total=len(Y)):
+            for px, py in batch:
+                f.writelines(f"{px}\t{py}\n")
 
     with open("fmnist_cols.txt", "w") as f:
         for row in test_data:
             f.writelines(f"{row[1]}\n")
-
-    classes = [
-        "T-shirt/top",
-        "Trouser",
-        "Pullover",
-        "Dress",
-        "Coat",
-        "Sandal",
-        "Shirt",
-        "Sneaker",
-        "Bag",
-        "Ankle boot",
-    ]
-
-    tsne.model.eval()
-    x, y = test_data[0][0], test_data[0][1]
-    with torch.no_grad():
-        m = tsne.model.to(torch.device("cpu"))
-        pred = m(x)
-        predicted, actual = classes[pred[0].argmax(0)], classes[y]
-        print(f'Predicted: "{predicted}", Actual: "{actual}"')
-    # plt.scatter(Y[:, 0], Y[:, 1], 20, labels)
-    # plt.show()
