@@ -1,11 +1,15 @@
 import argparse
-import pytorch_lightning as pl
-import torch.nn as nn
-import torch
+
 import numpy as np
-from torch.utils.data import DataLoader, random_split, TensorDataset, Dataset
+import pytorch_lightning as pl
+import torch
+import torch.nn as nn
 import torch.optim as optim
+from argparse_range import range_action
+from pytorch_lightning.callbacks import EarlyStopping
+from torch.utils.data import DataLoader, Dataset, TensorDataset, random_split
 from tqdm import tqdm
+from kde1d import kde1d
 
 
 def Hbeta(D: torch.Tensor, beta: float) -> tuple:
@@ -29,13 +33,13 @@ def x2p_job(data: tuple, tolerance: float, max_iterations: int = 50) -> tuple:
     while it < max_iterations and torch.abs(Hdiff) > tolerance:
         if Hdiff > 0:
             beta_min = beta
-            if np.isinf(beta_max):
+            if torch.isinf(torch.tensor(beta_max)):
                 beta *= 2
             else:
                 beta = (beta + beta_max) / 2
         else:
             beta_max = beta
-            if np.isinf(beta_min):
+            if torch.isinf(torch.tensor(beta_min)):
                 beta /= 2
             else:
                 beta = (beta + beta_max) / 2
@@ -54,13 +58,13 @@ def x2p(
     n = X.shape[0]
     logU = torch.log(torch.tensor([perplexity], device=X.device))
 
-    sum_X = torch.sum(torch.square(X), dim=1)  # tensor contains only value 16
+    sum_X = torch.sum(torch.square(X), dim=1)
     D = torch.add(torch.add(-2 * torch.mm(X, X.mT), sum_X).T, sum_X)
 
     idx = (1 - torch.eye(n)).type(torch.bool)
     D = D[idx].reshape((n, -1))
 
-    P = torch.zeros(n, n)
+    P = torch.zeros(n, n, device=X.device)
 
     for i in range(n):
         P[i, idx[i]] = x2p_job((i, D[i], logU), tolerance)[1]
@@ -68,16 +72,27 @@ def x2p(
 
 
 class NeuralNetwork(nn.Module):
-    def __init__(self) -> None:
+    def __init__(self, initial_features: int, n_components: int) -> None:
         super(NeuralNetwork, self).__init__()
+        # feautures_multipliers = [0.75] * 4
+        feautures_multipliers = [0.75, 0.6, 0.4]
         self.linear_relu_stack = nn.Sequential(
-            nn.Linear(32, 24),
+            nn.Linear(
+                initial_features, int(feautures_multipliers[0] * initial_features)
+            ),
             nn.ReLU(),
-            nn.Linear(24, 24),
+            nn.Linear(
+                int(feautures_multipliers[0] * initial_features),
+                int(feautures_multipliers[1] * initial_features),
+            ),
             nn.ReLU(),
-            nn.Linear(24, 2),
-            # nn.LogSoftmax(dim=1),
-        )
+            nn.Linear(
+                int(feautures_multipliers[1] * initial_features),
+                int(feautures_multipliers[2] * initial_features),
+            ),
+            nn.ReLU(),
+            nn.Linear(int(feautures_multipliers[2] * initial_features), n_components),
+        )  # add another / more layers
 
     def forward(self, x):
         logits = self.linear_relu_stack(x)
@@ -88,21 +103,21 @@ class ParametericTSNE:
     def __init__(
         self,
         loss_fn,
-        optimizer,
-        optimizer_params,
         n_components: int,
         perplexity: int,
         batch_size: int,
         early_exaggeration_epochs: int,
         early_exaggeration_value: float,
         max_iterations: int,
+        features: int,
         n_jobs: int = 0,
         tolerance: float = 1e-5,
+        diffusion_scaling: bool = False,
     ):
-        self.__device = (
+        self.device = (
             torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
         )
-        self.model = NeuralNetwork().to(self.__device)
+        self.model = NeuralNetwork(features, n_components).to(self.device)
 
         self.n_components = n_components
         self.perplexity = perplexity
@@ -112,19 +127,9 @@ class ParametericTSNE:
         self.n_jobs = n_jobs
         self.tolerance = tolerance
         self.max_iterations = max_iterations
+        self.diffusion_scaling = diffusion_scaling
 
-        self.optimizer = self.set_optimizer(optimizer, optimizer_params)
         self.loss_fn = self.set_loss_fn(loss_fn)
-
-    def set_optimizer(self, optimizer: str, optimizer_params: dict):
-        if optimizer == "adam":
-            return optim.Adam(self.model.parameters(), **optimizer_params)
-        elif optimizer == "sgd":
-            return optim.SGD(self.model.parameters(), **optimizer_params)
-        elif optimizer == "rmsprop":
-            return optim.RMSprop(self.model.parameters(), **optimizer_params)
-        else:
-            raise ValueError("Unknown optimizer")
 
     def set_loss_fn(self, loss_fn):
         if loss_fn == "kl_divergence":
@@ -136,21 +141,27 @@ class ParametericTSNE:
     def read_model(self, filename: str):
         self.model.load_state_dict(torch.load(filename))
 
-    def split_dataset(self, X, y=None, train_size=None, test_size=None):
+    def split_dataset(
+        self,
+        X: torch.Tensor,
+        y: torch.Tensor = None,
+        train_size: float = None,
+        test_size: float = None,
+    ):
         if train_size is None and test_size is None:
             train_size = 0.8
             test_size = 1 - train_size
         elif train_size is None:
-            train_size = 1 - test_size  # type: ignore
+            train_size = 1 - test_size
         elif test_size is None:
-            test_size = 1 - train_size  # type: ignore
+            test_size = 1 - train_size
 
         # X, y = self._adjust_size(X, y)
 
         if y is None:
             dataset = TensorDataset(X)
         else:
-            dataset = TensorDataset(X, y)  # type: ignore
+            dataset = TensorDataset(X, y)
         train_size = int(train_size * len(dataset))
         test_size = len(dataset) - train_size
         train_dataset, test_dataset = random_split(dataset, [train_size, test_size])
@@ -160,6 +171,7 @@ class ParametericTSNE:
                 batch_size=self.batch_size,
                 drop_last=True,
                 pin_memory=True,
+                # num_workers=self.n_jobs,
             )
         else:
             train_loader = None
@@ -169,6 +181,7 @@ class ParametericTSNE:
                 batch_size=self.batch_size,
                 drop_last=True,
                 pin_memory=True,
+                # num_workers=self.n_jobs,
             )
         else:
             test_loader = None
@@ -177,29 +190,42 @@ class ParametericTSNE:
 
     def _calculate_P(self, dataloader: torch.utils.data.DataLoader) -> torch.Tensor:
         n = len(dataloader.dataset)
-        P = torch.zeros((n, self.batch_size), device=self.__device)
+        P = torch.zeros((n, self.batch_size), device=self.device)
         for i, (X, *_) in tqdm(
-            enumerate(dataloader), unit="batches", total=len(dataloader)
+            enumerate(dataloader), unit="batch", total=len(dataloader)
         ):
             batch = x2p(X, self.perplexity, self.tolerance)
             batch[torch.isnan(batch)] = 0
             batch = batch + batch.T
             batch = batch / batch.sum()
-            batch = torch.maximum(batch, torch.Tensor([1e-12]))  # type: ignore
+            batch = batch if not self.diffusion_scaling else self._scale_P(batch)
+            batch = torch.maximum(
+                batch.to(self.device), torch.tensor([1e-12], device=self.device)
+            )
             P[i * self.batch_size : (i + 1) * self.batch_size] = batch
         return P
 
     def _kl_divergence(self, Y: torch.Tensor, P: torch.Tensor) -> torch.Tensor:
         sum_Y = torch.sum(torch.square(Y), dim=1)
-        eps = torch.tensor([1e-15], device=self.__device)
+        eps = torch.tensor([1e-15], device=self.device)
         D = sum_Y + torch.reshape(sum_Y, [-1, 1]) - 2 * torch.matmul(Y, Y.mT)
         Q = torch.pow(1 + D / 1.0, -(1.0 + 1) / 2)
-        Q *= 1 - torch.eye(self.batch_size, device=self.__device)
+        Q *= 1 - torch.eye(self.batch_size, device=self.device)
         Q /= torch.sum(Q)
         Q = torch.maximum(Q, eps)
         C = torch.log((P + eps) / (Q + eps))
         C = torch.sum(P * C)
         return C
+
+    def _scale_P(self, data: torch.Tensor) -> torch.Tensor:
+        scaled_data = torch.zeros(data.shape, device=self.device)
+        bandwidths = [kde1d(row)[2] for row in data]
+
+        bandwidth_sum = sum(bandwidths)
+        for i, row in enumerate(data):
+            scaled_data[i] = row / bandwidth_sum * bandwidths[i] * len(data)
+
+        return scaled_data
 
     def _adjust_size(self, X, y=None):
         if X.shape[0] % self.batch_size != 0:
@@ -211,39 +237,66 @@ class ParametericTSNE:
 
 
 class Classifier(pl.LightningModule):
-    def __init__(self, tsne: ParametericTSNE):
+    def __init__(
+        self,
+        tsne: ParametericTSNE,
+        shuffle: bool,
+        optimizer: str = "adam",
+        lr: float = 1e-3,
+    ):
         super().__init__()
         self.tsne = tsne
         self.batch_size = tsne.batch_size
         self.model = self.tsne.model
         self.loss_fn = tsne.loss_fn
+        self.exaggeration_epochs = tsne.early_exaggeration_epochs
+        self.exaggeration_value = tsne.early_exaggeration_value
+        self.shuffle = shuffle
+        self.lr = lr
+        self.optimizer = optimizer
 
     def training_step(self, batch, batch_idx):
         x = batch[0]
-
-        p_idxs = torch.randperm(x.shape[0])
-        x = x[p_idxs]
         _P_batch = self.P_copy[
             batch_idx * self.batch_size : (batch_idx + 1) * self.batch_size
         ]
-        _P_batch = _P_batch[p_idxs, :]
-        _P_batch = _P_batch[:, p_idxs]
+
+        if self.shuffle:
+            p_idxs = torch.randperm(x.shape[0])
+            x = x[p_idxs]
+            _P_batch = _P_batch[p_idxs, :]
+            _P_batch = _P_batch[:, p_idxs]
 
         logits = self.model(x)
         loss = self.loss_fn(logits, _P_batch)
         self.log(
             "train_loss", loss, on_step=True, on_epoch=True, prog_bar=True, logger=True
         )
-        return loss
+        return {"loss": loss}
+
+    def _set_optimizer(self, optimizer: str, optimizer_params: dict):
+        if optimizer == "adam":
+            return optim.Adam(self.model.parameters(), **optimizer_params)
+        elif optimizer == "sgd":
+            return optim.SGD(self.model.parameters(), **optimizer_params)
+        elif optimizer == "rmsprop":
+            return optim.RMSprop(self.model.parameters(), **optimizer_params)
+        else:
+            raise ValueError("Unknown optimizer")
 
     def configure_optimizers(self):
-        return self.tsne.optimizer
+        return self._set_optimizer(self.optimizer, {"lr": self.lr})
 
     def on_train_start(self) -> None:
         self.P = self.tsne._calculate_P(self.trainer.train_dataloader)
 
     def on_train_epoch_start(self) -> None:
         self.P_copy = self.P.clone()
+        if (
+            self.exaggeration_epochs > 0
+            and self.current_epoch < self.exaggeration_epochs
+        ):
+            self.P_copy *= self.exaggeration_value
 
     def on_train_epoch_end(self) -> None:
         del self.P_copy
@@ -304,16 +357,49 @@ if __name__ == "__main__":
         "-step", type=int, help="Step between samples", required=False, default=1
     )
     parser.add_argument(
-        "-exaggeration",
-        type=float,
+        "-exaggeration_iter",
+        type=int,
         help="Early exaggeration end",
         required=False,
         default=0,
     )
     parser.add_argument(
+        "-exaggeration_value",
+        type=float,
+        help="Early exaggeration value",
+        required=False,
+        default=12,
+    )
+    parser.add_argument(
         "-o", type=str, help="Output filename", required=False, default="result.txt"
     )
-    parser.add_argument("-model", type=str, help="Model filename", required=False)
+    parser.add_argument(
+        "-model_save",
+        type=str,
+        help="Model save filename",
+        required=False,
+    )
+    parser.add_argument(
+        "-model_load",
+        type=str,
+        help="Model filename to load",
+        required=False,
+    )
+    parser.add_argument("-shuffle", action="store_true", help="Shuffle data")
+    parser.add_argument(
+        "-train_size",
+        type=float,
+        action=range_action(0, 1),
+        help="Train size",
+        required=False,
+    )
+    parser.add_argument(
+        "-test_size",
+        type=float,
+        action=range_action(0, 1),
+        help="Test size",
+        required=False,
+    )
 
     args = parser.parse_args(
         [
@@ -321,18 +407,19 @@ if __name__ == "__main__":
             "-no_dims",
             "2",
             "-perplexity",
-            "200",
+            "150",
             "-exclude_cols",
             "-1",
             "0",
             "-step",
-            "25",
+            "1",
             "-iter",
             "200",
             "-o",
-            "lightning_test.txt",
-            # "-model",
-            # "model.pth",
+            "pytorch_results/lightning_4_layers_full.txt",
+            "-model_load",
+            "pytorch_results/lightning_4_layers.pth",
+            "-shuffle",
         ]
     )
     labels = None
@@ -363,19 +450,23 @@ if __name__ == "__main__":
         for v in range(len(means)):
             f.writelines(f"{v}\t{means[v]}\t{vars[v]}\n")
 
-    data = torch.from_numpy(data).float()
-
     tsne = ParametericTSNE(
         "kl_divergence",
-        "adam",
-        {"lr": 1e-3},
         args.no_dims,
         args.perplexity,
         1000,
         0,
         0,
         args.iter,
-        5,
+        data.shape[1],
+        6,
+        diffusion_scaling=True,
+    )
+
+    data = torch.from_numpy(data).float()
+
+    early_stopping = EarlyStopping(
+        "train_loss_epoch", min_delta=1e-4, patience=1, verbose=True
     )
 
     trainer = pl.Trainer(
@@ -383,21 +474,30 @@ if __name__ == "__main__":
         devices=1,
         log_every_n_steps=1,
         max_epochs=args.iter,
+        callbacks=[early_stopping],
+        auto_lr_find=True,
     )
-    classifier = Classifier(tsne)
+    classifier = Classifier(tsne, args.shuffle)
 
-    if args.model:
-        tsne.read_model(args.model)
+    if args.model_load:
+        tsne.read_model(args.model_load)
         train, test = tsne.split_dataset(data, test_size=1)
         Y = trainer.predict(classifier, test)
     else:
-        train, test = tsne.split_dataset(data, train_size=0.8)
+        if args.train_size is not None:
+            train_size = args.train_size
+        elif args.test_size is not None:
+            train_size = 1 - args.test_size
+        else:
+            train_size = 0.8
+        train, test = tsne.split_dataset(data, train_size=train_size)
         trainer.fit(classifier, train)
-        tsne.save_model("model.pth")
+        if args.model_save:
+            tsne.save_model(args.model_save)
         Y = trainer.predict(classifier, test)
 
     with open(args.o, "w") as f:
         f.writelines(f"{args.step}\n")
-        for i, batch in tqdm(enumerate(Y), unit="samples", total=len(Y)):
+        for i, batch in tqdm(enumerate(Y), unit="sample", total=len(Y)):
             for px, py in batch:
                 f.writelines(f"{px}\t{py}\n")
