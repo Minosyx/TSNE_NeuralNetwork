@@ -54,6 +54,7 @@ def x2p(
     X: torch.Tensor,
     perplexity: int,
     tolerance: float,
+    use_kde_diff: bool,
 ) -> torch.Tensor:
     n = X.shape[0]
     logU = torch.log(torch.tensor([perplexity], device=X.device))
@@ -67,15 +68,19 @@ def x2p(
     P = torch.zeros(n, n, device=X.device)
 
     for i in range(n):
-        P[i, idx[i]] = x2p_job((i, D[i], logU), tolerance)[1]
+        P[i, idx[i]] = (
+            x2p_job((i, D[i], logU), tolerance)[1]
+            if not use_kde_diff
+            else kde1d(D[i])[0]
+        )
     return P
 
 
 class NeuralNetwork(nn.Module):
     def __init__(self, initial_features: int, n_components: int) -> None:
         super(NeuralNetwork, self).__init__()
-        # feautures_multipliers = [0.75] * 4
-        feautures_multipliers = [0.75, 0.6, 0.4]
+        feautures_multipliers = [1] * 3
+        # feautures_multipliers = [0.75, 0.6, 0.4]
         self.linear_relu_stack = nn.Sequential(
             nn.Linear(
                 initial_features, int(feautures_multipliers[0] * initial_features)
@@ -85,13 +90,13 @@ class NeuralNetwork(nn.Module):
                 int(feautures_multipliers[0] * initial_features),
                 int(feautures_multipliers[1] * initial_features),
             ),
+            # nn.ReLU(),
+            # nn.Linear(
+            #     int(feautures_multipliers[1] * initial_features),
+            #     int(feautures_multipliers[2] * initial_features),
+            # ),
             nn.ReLU(),
-            nn.Linear(
-                int(feautures_multipliers[1] * initial_features),
-                int(feautures_multipliers[2] * initial_features),
-            ),
-            nn.ReLU(),
-            nn.Linear(int(feautures_multipliers[2] * initial_features), n_components),
+            nn.Linear(int(feautures_multipliers[-1] * initial_features), n_components),
         )  # add another / more layers
 
     def forward(self, x):
@@ -113,6 +118,7 @@ class ParametericTSNE:
         n_jobs: int = 0,
         tolerance: float = 1e-5,
         diffusion_scaling: bool = False,
+        use_kde_diff: bool = False,
     ):
         self.device = (
             torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
@@ -128,6 +134,7 @@ class ParametericTSNE:
         self.tolerance = tolerance
         self.max_iterations = max_iterations
         self.diffusion_scaling = diffusion_scaling
+        self.use_kde_diff = use_kde_diff
 
         self.loss_fn = self.set_loss_fn(loss_fn)
 
@@ -194,7 +201,7 @@ class ParametericTSNE:
         for i, (X, *_) in tqdm(
             enumerate(dataloader), unit="batch", total=len(dataloader)
         ):
-            batch = x2p(X, self.perplexity, self.tolerance)
+            batch = x2p(X, self.perplexity, self.tolerance, self.use_kde_diff)
             batch[torch.isnan(batch)] = 0
             batch = batch + batch.T
             batch = batch / batch.sum()
@@ -400,26 +407,54 @@ if __name__ == "__main__":
         help="Test size",
         required=False,
     )
+    parser.add_argument(
+        "-kde_diff",
+        action="store_true",
+        help="Use KDE instead of calculating distances to probabilities",
+    )
 
+    # args = parser.parse_args(
+    #     [
+    #         "tsne/colvar-tf.data",
+    #         "-no_dims",
+    #         "2",
+    #         "-perplexity",
+    #         "150",
+    #         "-exclude_cols",
+    #         "-1",
+    #         "0",
+    #         "-step",
+    #         "1",
+    #         "-iter",
+    #         "200",
+    #         "-o",
+    #         "pytorch_results/lightning_early_kde_full.txt",
+    #         "-model_load",
+    #         "pytorch_results/lightning_early_kde.pth",
+    #         "-shuffle",
+    #         "-kde_diff",
+    #     ]
+    # )
     args = parser.parse_args(
         [
-            "tsne/colvar-tf.data",
+            "swiss_roll_2.txt",
             "-no_dims",
             "2",
             "-perplexity",
-            "150",
-            "-exclude_cols",
-            "-1",
-            "0",
+            "100",
+            # "-exclude_cols",
+            # "-1",
+            # "0",
             "-step",
             "1",
             "-iter",
             "200",
             "-o",
-            "pytorch_results/lightning_4_layers_full.txt",
+            "pytorch_results/swiss_roll_kde_scale_x2p_big_batch_small_data_full.txt",
             "-model_load",
-            "pytorch_results/lightning_4_layers.pth",
+            "pytorch_results/swiss_roll_kde_scale_x2p_big_batch_small_data_full.pth",
             "-shuffle",
+            "-kde_diff",
         ]
     )
     labels = None
@@ -428,8 +463,8 @@ if __name__ == "__main__":
         args.labels.close()
 
     cols = None
+    args.input_file.readline()
     if args.exclude_cols:
-        args.input_file.readline()
         last_pos = args.input_file.tell()
         ncols = len(args.input_file.readline().strip().split(" "))
         args.input_file.seek(last_pos)
@@ -454,13 +489,14 @@ if __name__ == "__main__":
         "kl_divergence",
         args.no_dims,
         args.perplexity,
-        1000,
+        5000,
         0,
         0,
         args.iter,
         data.shape[1],
         6,
-        diffusion_scaling=True,
+        False,
+        args.kde_diff,
     )
 
     data = torch.from_numpy(data).float()
@@ -498,6 +534,6 @@ if __name__ == "__main__":
 
     with open(args.o, "w") as f:
         f.writelines(f"{args.step}\n")
-        for i, batch in tqdm(enumerate(Y), unit="sample", total=len(Y)):
+        for i, batch in tqdm(enumerate(Y), unit="samples", total=len(Y)):
             for px, py in batch:
                 f.writelines(f"{px}\t{py}\n")
