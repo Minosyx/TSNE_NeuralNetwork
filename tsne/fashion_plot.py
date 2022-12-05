@@ -39,7 +39,7 @@ if __name__ == "__main__":
     step = None
 
     with open(args.input_file, "r") as f:
-        # step = int(f.readline())
+        step = int(f.readline())
         data = np.loadtxt(f)
 
     dims = len(data.shape)
@@ -63,6 +63,8 @@ if __name__ == "__main__":
         "Bag",
         "Ankle boot",
     ]
+
+    # classes = [i for i in range(10)]
 
     # plt.scatter(
     #     data[:, 0], data[:, 1], 20, alpha=args.alpha, marker="."

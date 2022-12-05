@@ -7,9 +7,12 @@ import torch.nn as nn
 import torch.optim as optim
 from argparse_range import range_action
 from pytorch_lightning.callbacks import EarlyStopping
-from torch.utils.data import DataLoader, Dataset, TensorDataset, random_split
+from torch.utils.data import DataLoader, Dataset, TensorDataset, random_split, Subset
 from tqdm import tqdm
 from kde1d import kde1d
+import get_datasets
+import sys
+from typing import Tuple
 
 
 def Hbeta(D: torch.Tensor, beta: float) -> tuple:
@@ -79,8 +82,9 @@ def x2p(
 class NeuralNetwork(nn.Module):
     def __init__(self, initial_features: int, n_components: int) -> None:
         super(NeuralNetwork, self).__init__()
-        feautures_multipliers = [1] * 3
+        # feautures_multipliers = [1] * 3
         # feautures_multipliers = [0.75, 0.6, 0.4]
+        feautures_multipliers = [0.654] * 2
         self.linear_relu_stack = nn.Sequential(
             nn.Linear(
                 initial_features, int(feautures_multipliers[0] * initial_features)
@@ -154,7 +158,7 @@ class ParametericTSNE:
         y: torch.Tensor = None,
         train_size: float = None,
         test_size: float = None,
-    ):
+    ) -> Tuple[DataLoader, DataLoader]:
         if train_size is None and test_size is None:
             train_size = 0.8
             test_size = 1 - train_size
@@ -172,27 +176,38 @@ class ParametericTSNE:
         train_size = int(train_size * len(dataset))
         test_size = len(dataset) - train_size
         train_dataset, test_dataset = random_split(dataset, [train_size, test_size])
-        if train_size > 0:
-            train_loader = DataLoader(
-                train_dataset,
-                batch_size=self.batch_size,
-                drop_last=True,
-                pin_memory=True,
-                # num_workers=self.n_jobs,
-            )
-        else:
-            train_loader = None
-        if test_size > 0:
-            test_loader = DataLoader(
-                test_dataset,
-                batch_size=self.batch_size,
-                drop_last=True,
-                pin_memory=True,
-                # num_workers=self.n_jobs,
-            )
-        else:
-            test_loader = None
+        if train_size == 0:
+            train_dataset = None
+        if test_size == 0:
+            test_dataset = None
 
+        return self.create_dataloaders(train_dataset, test_dataset)
+
+    def create_dataloaders(
+        self, train: Dataset, test: Dataset
+    ) -> Tuple[DataLoader, DataLoader]:
+        train_loader = (
+            DataLoader(
+                train,
+                batch_size=self.batch_size,
+                drop_last=True,
+                pin_memory=True,
+                # num_workers=self.n_jobs,
+            )
+            if train is not None
+            else None
+        )
+        test_loader = (
+            DataLoader(
+                test,
+                batch_size=self.batch_size,
+                drop_last=True,
+                pin_memory=True,
+                # num_workers=self.n_jobs,
+            )
+            if test is not None
+            else None
+        )
         return train_loader, test_loader
 
     def _calculate_P(self, dataloader: torch.utils.data.DataLoader) -> torch.Tensor:
@@ -324,11 +339,25 @@ class FileTypeWithExtensionCheck(argparse.FileType):
         return super().__call__(string)
 
 
+class FileTypeWithExtensionCheckPredefined(FileTypeWithExtensionCheck):
+    def __call__(self, string):
+        if available_datasets and string in available_datasets:
+            return string
+        if self.valid_extensions:
+            if not string.endswith(self.valid_extensions):
+                raise argparse.ArgumentTypeError("Not a valid filename extension!")
+        return super().__call__(string)
+
+
 if __name__ == "__main__":
+    if "get_datasets" in sys.modules:
+        global available_datasets
+        available_datasets = get_datasets.get_available_datasets()
+
     parser = argparse.ArgumentParser(description="t-SNE Algorithm")
     parser.add_argument(
         "input_file",
-        type=FileTypeWithExtensionCheck(valid_extensions=("txt", "data")),
+        type=FileTypeWithExtensionCheckPredefined(valid_extensions=("txt", "data")),
         help="Input file",
     )
     parser.add_argument(
@@ -412,7 +441,12 @@ if __name__ == "__main__":
         action="store_true",
         help="Use KDE instead of calculating distances to probabilities",
     )
-
+    parser.add_argument(
+        "-jobs", type=int, help="Number of jobs", required=False, default=1
+    )
+    parser.add_argument(
+        "-batch_size", type=int, help="Batch size", required=False, default=1000
+    )
     # args = parser.parse_args(
     #     [
     #         "tsne/colvar-tf.data",
@@ -435,79 +469,121 @@ if __name__ == "__main__":
     #         "-kde_diff",
     #     ]
     # )
+    # args = parser.parse_args(
+    #     [
+    #         "swiss_roll_2.txt",
+    #         "-no_dims",
+    #         "2",
+    #         "-perplexity",
+    #         "100",
+    #         # "-exclude_cols",
+    #         # "-1",
+    #         # "0",
+    #         "-step",
+    #         "1",
+    #         "-iter",
+    #         "200",
+    #         "-o",
+    #         "pytorch_results/swiss_roll_kde_scale_x2p_big_batch_small_data_full.txt",
+    #         "-model_load",
+    #         "pytorch_results/swiss_roll_kde_scale_x2p_big_batch_small_data_full.pth",
+    #         "-shuffle",
+    #         "-kde_diff",
+    #     ]
+    # )
+
     args = parser.parse_args(
         [
-            "swiss_roll_2.txt",
+            "fashion_mnist",
             "-no_dims",
             "2",
             "-perplexity",
-            "100",
-            # "-exclude_cols",
-            # "-1",
-            # "0",
+            "250",
             "-step",
             "1",
             "-iter",
             "200",
             "-o",
-            "pytorch_results/swiss_roll_kde_scale_x2p_big_batch_small_data_full.txt",
-            "-model_load",
-            "pytorch_results/swiss_roll_kde_scale_x2p_big_batch_small_data_full.pth",
+            "pytorch_results/fashion__kde_shuffle.txt",
+            "-model_save",
+            "pytorch_results/fashion_kde_shuffle.pth",
             "-shuffle",
             "-kde_diff",
+            "-jobs",
+            "6",
         ]
     )
-    labels = None
-    if args.labels:
-        labels = np.loadtxt(args.labels)
-        args.labels.close()
 
-    cols = None
-    args.input_file.readline()
-    if args.exclude_cols:
-        last_pos = args.input_file.tell()
-        ncols = len(args.input_file.readline().strip().split(" "))
-        args.input_file.seek(last_pos)
-        cols = np.arange(0, ncols, 1)
-        cols = tuple(np.delete(cols, args.exclude_cols))
+    if (
+        available_datasets
+        and (name := args.input_file.rsplit(".", maxsplit=1)[0].lower())
+        in available_datasets
+    ):
+        train, test = get_datasets.get_dataset(name)
+        train = Subset(train, range(0, len(train), args.step))
+        skip_loading_data = True
+        shape = np.prod(train.dataset.data.shape[1:])
 
-    X = np.loadtxt(args.input_file, usecols=cols)
+        with open(
+            args.o.rsplit("/", maxsplit=1)[0] + "/" + args.input_file + "_cols.txt", "w"
+        ) as f:
+            for row in test:
+                f.writelines(f"{row[1]}\n")
 
-    args.input_file.close()
+    if not skip_loading_data:
+        labels = None
+        if args.labels:
+            labels = np.loadtxt(args.labels)
+            args.labels.close()
 
-    data = np.array(X[:: args.step, :])
+        cols = None
+        args.input_file.readline()
+        if args.exclude_cols:
+            last_pos = args.input_file.tell()
+            ncols = len(args.input_file.readline().strip().split(" "))
+            args.input_file.seek(last_pos)
+            cols = np.arange(0, ncols, 1)
+            cols = tuple(np.delete(cols, args.exclude_cols))
 
-    means = data.mean(axis=0)
-    vars = data.var(axis=0)
+        X = np.loadtxt(args.input_file, usecols=cols)
 
-    with open("means_and_vars.txt", "w") as f:
-        f.writelines("column\tmean\tvar\n")
-        for v in range(len(means)):
-            f.writelines(f"{v}\t{means[v]}\t{vars[v]}\n")
+        args.input_file.close()
+
+        data = np.array(X[:: args.step, :])
+
+        means = data.mean(axis=0)
+        vars = data.var(axis=0)
+        shape = data.shape[0]
+
+        with open("means_and_vars.txt", "w") as f:
+            f.writelines("column\tmean\tvar\n")
+            for v in range(len(means)):
+                f.writelines(f"{v}\t{means[v]}\t{vars[v]}\n")
+
+        data = torch.from_numpy(data).float()
 
     tsne = ParametericTSNE(
         "kl_divergence",
         args.no_dims,
         args.perplexity,
-        5000,
-        0,
-        0,
+        args.batch_size,
+        args.exaggeration_iter,
+        args.exaggeration_value,
         args.iter,
-        data.shape[1],
-        6,
+        shape,
+        args.jobs,
         False,
         args.kde_diff,
     )
 
-    data = torch.from_numpy(data).float()
-
     early_stopping = EarlyStopping(
-        "train_loss_epoch", min_delta=1e-4, patience=1, verbose=True
+        "train_loss_epoch", min_delta=1e-4, patience=10, verbose=True
     )
 
+    is_gpu = tsne.device == torch.device("cuda:0")
     trainer = pl.Trainer(
-        accelerator="gpu",
-        devices=1,
+        accelerator="gpu" if is_gpu else "cpu",
+        devices=1 if is_gpu else tsne.n_jobs,
         log_every_n_steps=1,
         max_epochs=args.iter,
         callbacks=[early_stopping],
@@ -517,7 +593,11 @@ if __name__ == "__main__":
 
     if args.model_load:
         tsne.read_model(args.model_load)
-        train, test = tsne.split_dataset(data, test_size=1)
+        train, test = (
+            tsne.split_dataset(data, test_size=1)
+            if not skip_loading_data
+            else tsne.create_dataloaders(train, test)
+        )
         Y = trainer.predict(classifier, test)
     else:
         if args.train_size is not None:
@@ -526,7 +606,11 @@ if __name__ == "__main__":
             train_size = 1 - args.test_size
         else:
             train_size = 0.8
-        train, test = tsne.split_dataset(data, train_size=train_size)
+        train, test = (
+            tsne.split_dataset(data, train_size=train_size)
+            if not skip_loading_data
+            else tsne.create_dataloaders(train, test)
+        )
         trainer.fit(classifier, train)
         if args.model_save:
             tsne.save_model(args.model_save)
@@ -534,6 +618,6 @@ if __name__ == "__main__":
 
     with open(args.o, "w") as f:
         f.writelines(f"{args.step}\n")
-        for i, batch in tqdm(enumerate(Y), unit="samples", total=len(Y)):
+        for i, batch in tqdm(enumerate(Y), unit="samples", total=(len(Y))):
             for px, py in batch:
                 f.writelines(f"{px}\t{py}\n")
