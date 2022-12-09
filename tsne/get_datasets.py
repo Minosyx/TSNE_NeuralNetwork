@@ -65,6 +65,6 @@ def prepare_dataset(dataset_name: str) -> Tuple[Dataset, Dataset]:
 
 def get_dataset(dataset_name: str) -> Tuple[Dataset, Dataset]:
     name = dataset_name.lower()
-    if name in ["mnist", "fashion_mnist"]:
+    if name in get_available_datasets():
         return prepare_dataset(name)
     return None, None

@@ -1,4 +1,6 @@
 import argparse
+from collections import OrderedDict
+import io
 
 import numpy as np
 import pytorch_lightning as pl
@@ -12,7 +14,73 @@ from tqdm import tqdm
 from kde1d import kde1d
 import get_datasets
 import sys
-from typing import Tuple
+from typing import Tuple, Union
+import torchinfo
+
+
+def load_torch_dataset(name: str, step: int, output: str) -> Tuple[Dataset, Dataset]:
+    train, test = get_datasets.get_dataset(name)
+    train = Subset(train, range(0, len(train), step))
+
+    with open(output.rsplit("/", maxsplit=1)[0] + "/" + name + "_cols.txt", "w") as f:
+        for row in test:
+            f.writelines(f"{row[1]}\n")
+
+    return train, test
+
+
+def load_labels(labels: io.TextIOWrapper) -> Union[np.ndarray, None]:
+    if labels:
+        labels = np.loadtxt(args.labels)
+        labels.close()
+    return labels
+
+
+def load_text_file(
+    input_file: io.TextIOWrapper, step: int, header: bool, exclude_cols: list
+) -> torch.Tensor:
+    cols = None
+    if header:
+        input_file.readline()
+    if exclude_cols:
+        last_pos = input_file.tell()
+        ncols = len(input_file.readline().strip().split(" "))
+        input_file.seek(last_pos)
+        cols = np.arange(0, ncols, 1)
+        cols = tuple(np.delete(cols, exclude_cols))
+
+    X = np.loadtxt(input_file, usecols=cols)
+
+    input_file.close()
+
+    data = np.array(X[::step, :])
+
+    means = data.mean(axis=0)
+    vars = data.var(axis=0)
+
+    with open("means_and_vars.txt", "w") as f:
+        f.writelines("column\tmean\tvar\n")
+        for v in range(len(means)):
+            f.writelines(f"{v}\t{means[v]}\t{vars[v]}\n")
+
+    data = torch.from_numpy(data).float()
+
+    return data
+
+
+def load_npy_file(
+    input_file: io.TextIOWrapper, step: int, exclude_cols: list
+) -> torch.Tensor:
+    name = input_file.name
+    input_file.close()
+    data = np.load(name)
+    cols = data.shape[1]
+    data = data[::step, :]
+    if exclude_cols:
+        data = np.delete(data, exclude_cols, axis=1)
+    data = torch.from_numpy(data).float()
+
+    return data
 
 
 def Hbeta(D: torch.Tensor, beta: float) -> tuple:
@@ -80,28 +148,28 @@ def x2p(
 
 
 class NeuralNetwork(nn.Module):
-    def __init__(self, initial_features: int, n_components: int) -> None:
+    def __init__(
+        self, initial_features: int, n_components: int, multipliers: list
+    ) -> None:
         super(NeuralNetwork, self).__init__()
         # feautures_multipliers = [1] * 3
         # feautures_multipliers = [0.75, 0.6, 0.4]
-        feautures_multipliers = [0.654] * 2
-        self.linear_relu_stack = nn.Sequential(
-            nn.Linear(
-                initial_features, int(feautures_multipliers[0] * initial_features)
-            ),
-            nn.ReLU(),
-            nn.Linear(
-                int(feautures_multipliers[0] * initial_features),
-                int(feautures_multipliers[1] * initial_features),
-            ),
-            # nn.ReLU(),
-            # nn.Linear(
-            #     int(feautures_multipliers[1] * initial_features),
-            #     int(feautures_multipliers[2] * initial_features),
-            # ),
-            nn.ReLU(),
-            nn.Linear(int(feautures_multipliers[-1] * initial_features), n_components),
-        )  # add another / more layers
+        # feautures_multipliers = [0.654] * 2
+        layers = OrderedDict()
+        layers["0"] = nn.Linear(
+            initial_features, int(multipliers[0] * initial_features)
+        )
+        for i in range(1, len(multipliers)):
+            layers["ReLu" + str(i - 1)] = nn.ReLU()
+            layers[str(i)] = nn.Linear(
+                int(multipliers[i - 1] * initial_features),
+                int(multipliers[i] * initial_features),
+            )
+            layers["ReLu" + str(i)] = nn.ReLU()
+        layers[str(len(multipliers))] = nn.Linear(
+            int(multipliers[-1] * initial_features), n_components
+        )
+        self.linear_relu_stack = nn.Sequential(layers)
 
     def forward(self, x):
         logits = self.linear_relu_stack(x)
@@ -119,6 +187,7 @@ class ParametericTSNE:
         early_exaggeration_value: float,
         max_iterations: int,
         features: int,
+        multipliers: list,
         n_jobs: int = 0,
         tolerance: float = 1e-5,
         diffusion_scaling: bool = False,
@@ -127,7 +196,18 @@ class ParametericTSNE:
         self.device = (
             torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
         )
-        self.model = NeuralNetwork(features, n_components).to(self.device)
+        self.model = NeuralNetwork(features, n_components, multipliers).to(self.device)
+        torchinfo.summary(
+            self.model,
+            input_size=(batch_size, 1, features),
+            col_names=(
+                "input_size",
+                "output_size",
+                "num_params",
+                "kernel_size",
+                "mult_adds",
+            ),
+        )
 
         self.n_components = n_components
         self.perplexity = perplexity
@@ -341,7 +421,7 @@ class FileTypeWithExtensionCheck(argparse.FileType):
 
 class FileTypeWithExtensionCheckPredefined(FileTypeWithExtensionCheck):
     def __call__(self, string):
-        if available_datasets and string in available_datasets:
+        if len(available_datasets) > 0 and string in available_datasets:
             return string
         if self.valid_extensions:
             if not string.endswith(self.valid_extensions):
@@ -357,7 +437,9 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="t-SNE Algorithm")
     parser.add_argument(
         "input_file",
-        type=FileTypeWithExtensionCheckPredefined(valid_extensions=("txt", "data")),
+        type=FileTypeWithExtensionCheckPredefined(
+            valid_extensions=("txt", "data", "npy")
+        ),
         help="Input file",
     )
     parser.add_argument(
@@ -447,54 +529,19 @@ if __name__ == "__main__":
     parser.add_argument(
         "-batch_size", type=int, help="Batch size", required=False, default=1000
     )
-    # args = parser.parse_args(
-    #     [
-    #         "tsne/colvar-tf.data",
-    #         "-no_dims",
-    #         "2",
-    #         "-perplexity",
-    #         "150",
-    #         "-exclude_cols",
-    #         "-1",
-    #         "0",
-    #         "-step",
-    #         "1",
-    #         "-iter",
-    #         "200",
-    #         "-o",
-    #         "pytorch_results/lightning_early_kde_full.txt",
-    #         "-model_load",
-    #         "pytorch_results/lightning_early_kde.pth",
-    #         "-shuffle",
-    #         "-kde_diff",
-    #     ]
-    # )
-    # args = parser.parse_args(
-    #     [
-    #         "swiss_roll_2.txt",
-    #         "-no_dims",
-    #         "2",
-    #         "-perplexity",
-    #         "100",
-    #         # "-exclude_cols",
-    #         # "-1",
-    #         # "0",
-    #         "-step",
-    #         "1",
-    #         "-iter",
-    #         "200",
-    #         "-o",
-    #         "pytorch_results/swiss_roll_kde_scale_x2p_big_batch_small_data_full.txt",
-    #         "-model_load",
-    #         "pytorch_results/swiss_roll_kde_scale_x2p_big_batch_small_data_full.pth",
-    #         "-shuffle",
-    #         "-kde_diff",
-    #     ]
-    # )
+
+    parser.add_argument("-header", action="store_true", help="Data has header")
+    parser.add_argument(
+        "-net_multipliers",
+        type=float,
+        nargs="+",
+        help="Network multipliers",
+        default="0.75 0.75 0.75",
+    )
 
     args = parser.parse_args(
         [
-            "fashion_mnist",
+            "tsne/colvar-ala1-wtm-tail.npy",
             "-no_dims",
             "2",
             "-perplexity",
@@ -504,63 +551,49 @@ if __name__ == "__main__":
             "-iter",
             "200",
             "-o",
-            "pytorch_results/fashion__kde_shuffle.txt",
+            "pytorch_results/ttt.txt",
             "-model_save",
-            "pytorch_results/fashion_kde_shuffle.pth",
+            "pytorch_results/ttt.pth",
             "-shuffle",
             "-kde_diff",
             "-jobs",
             "6",
+            "-exclude_cols",
+            "-1",
+            "-header",
+            "-batch_size",
+            "1000",
+            "-net_multipliers",
+            "0.8",
+            "1.5",
+            "1.7",
+            "0.9",
+            "1.2",
+            "0.6",
+            "0.85",
         ]
     )
 
+    skip_loading_data = False
     if (
-        available_datasets
-        and (name := args.input_file.rsplit(".", maxsplit=1)[0].lower())
-        in available_datasets
+        not isinstance(args.input_file, io.TextIOWrapper)
+        and len(available_datasets) > 0
+        and (name := args.input_file.lower()) in available_datasets
     ):
-        train, test = get_datasets.get_dataset(name)
-        train = Subset(train, range(0, len(train), args.step))
+        train, test = load_torch_dataset(name, args.step, args.o)
         skip_loading_data = True
         shape = np.prod(train.dataset.data.shape[1:])
 
-        with open(
-            args.o.rsplit("/", maxsplit=1)[0] + "/" + args.input_file + "_cols.txt", "w"
-        ) as f:
-            for row in test:
-                f.writelines(f"{row[1]}\n")
-
     if not skip_loading_data:
-        labels = None
-        if args.labels:
-            labels = np.loadtxt(args.labels)
-            args.labels.close()
+        labels = load_labels(args.labels)
 
-        cols = None
-        args.input_file.readline()
-        if args.exclude_cols:
-            last_pos = args.input_file.tell()
-            ncols = len(args.input_file.readline().strip().split(" "))
-            args.input_file.seek(last_pos)
-            cols = np.arange(0, ncols, 1)
-            cols = tuple(np.delete(cols, args.exclude_cols))
-
-        X = np.loadtxt(args.input_file, usecols=cols)
-
-        args.input_file.close()
-
-        data = np.array(X[:: args.step, :])
-
-        means = data.mean(axis=0)
-        vars = data.var(axis=0)
-        shape = data.shape[0]
-
-        with open("means_and_vars.txt", "w") as f:
-            f.writelines("column\tmean\tvar\n")
-            for v in range(len(means)):
-                f.writelines(f"{v}\t{means[v]}\t{vars[v]}\n")
-
-        data = torch.from_numpy(data).float()
+        if args.input_file.name.endswith(".npy"):
+            data = load_npy_file(args.input_file, args.step, args.exclude_cols)
+        else:
+            data = load_text_file(
+                args.input_file, args.step, args.header, args.exclude_cols
+            )
+        shape = data.shape[1]
 
     tsne = ParametericTSNE(
         "kl_divergence",
@@ -571,13 +604,14 @@ if __name__ == "__main__":
         args.exaggeration_value,
         args.iter,
         shape,
+        args.net_multipliers,
         args.jobs,
         False,
         args.kde_diff,
     )
 
     early_stopping = EarlyStopping(
-        "train_loss_epoch", min_delta=1e-4, patience=10, verbose=True
+        "train_loss_epoch", min_delta=1e-4, patience=5, verbose=False
     )
 
     is_gpu = tsne.device == torch.device("cuda:0")

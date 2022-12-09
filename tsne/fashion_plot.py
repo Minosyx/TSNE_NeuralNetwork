@@ -64,7 +64,7 @@ if __name__ == "__main__":
         "Ankle boot",
     ]
 
-    # classes = [i for i in range(10)]
+    classes = [i for i in range(10)]
 
     # plt.scatter(
     #     data[:, 0], data[:, 1], 20, alpha=args.alpha, marker="."
