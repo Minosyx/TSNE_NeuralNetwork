@@ -2,12 +2,13 @@ import sklearn.datasets as skd
 import numpy as np
 import matplotlib.pyplot as plt
 
-roll = skd.make_swiss_roll(n_samples=10000, noise=0.0, random_state=None)
+roll, sr_color = skd.make_swiss_roll(n_samples=10000, noise=0.0, random_state=None)
 
-np.savetxt("swiss_roll_2.txt", roll[0], delimiter=" ")
+np.savetxt("swiss_roll_2.txt", roll, delimiter=" ")
+np.savetxt("swiss_roll_color_2.txt", sr_color, delimiter=" ")
 
-# data = np.loadtxt("swiss_roll.txt", delimiter=" ", skiprows=1)
-
-# ax = plt.axes(projection="3d")
-# ax.scatter3D(data[:, 0], data[:, 1], data[:, 2], c=data[:, 2], cmap="Greens")
-# plt.show()
+# plot the data
+fig = plt.figure()
+ax = fig.add_subplot(111, projection="3d")
+ax.scatter(roll[:, 0], roll[:, 1], roll[:, 2], c=sr_color, s=1)
+plt.show()

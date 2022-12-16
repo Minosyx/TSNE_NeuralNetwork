@@ -37,7 +37,11 @@ def load_labels(labels: io.TextIOWrapper) -> Union[np.ndarray, None]:
 
 
 def load_text_file(
-    input_file: io.TextIOWrapper, step: int, header: bool, exclude_cols: list
+    input_file: io.TextIOWrapper,
+    step: int,
+    header: bool,
+    exclude_cols: list,
+    variance_treshold: float,
 ) -> torch.Tensor:
     cols = None
     if header:
@@ -58,18 +62,34 @@ def load_text_file(
     means = data.mean(axis=0)
     vars = data.var(axis=0)
 
+    if variance_treshold:
+        cols = np.where(vars > variance_treshold)[0]
+        data = data[:, cols]
+
     with open("means_and_vars.txt", "w") as f:
         f.writelines("column\tmean\tvar\n")
         for v in range(len(means)):
             f.writelines(f"{v}\t{means[v]}\t{vars[v]}\n")
 
+    # data = (data - data.min()) / (data.max() - data.min())
+
     data = torch.from_numpy(data).float()
+
+    # data = (data - data.mean(dim=0)) / data.std(dim=0)
+
+    # for i in range(data.shape[1]):
+    #     data[:, i] = (data[:, i] - data[:, i].min()) / (
+    #         data[:, i].max() - data[:, i].min()
+    #     )
 
     return data
 
 
 def load_npy_file(
-    input_file: io.TextIOWrapper, step: int, exclude_cols: list
+    input_file: io.TextIOWrapper,
+    step: int,
+    exclude_cols: list,
+    variance_treshold: float,
 ) -> torch.Tensor:
     name = input_file.name
     input_file.close()
@@ -78,7 +98,29 @@ def load_npy_file(
     data = data[::step, :]
     if exclude_cols:
         data = np.delete(data, exclude_cols, axis=1)
+
+    means = data.mean(axis=0)
+    vars = data.var(axis=0)
+
+    if variance_treshold:
+        cols = np.where(vars > variance_treshold)[0]
+        data = data[:, cols]
+
+    with open("means_and_vars.txt", "w") as f:
+        f.writelines("column\tmean\tvar\n")
+        for v in range(len(means)):
+            f.writelines(f"{v}\t{means[v]}\t{vars[v]}\n")
+
+    # data = (data - data.min()) / (data.max() - data.min())
+
     data = torch.from_numpy(data).float()
+
+    data = (data - data.mean(dim=0)) / data.std(dim=0)
+
+    for i in range(data.shape[1]):
+        data[:, i] = (data[:, i] - data[:, i].min()) / (
+            data[:, i].max() - data[:, i].min()
+        )
 
     return data
 
@@ -166,6 +208,8 @@ class NeuralNetwork(nn.Module):
                 int(multipliers[i] * initial_features),
             )
             layers["ReLu" + str(i)] = nn.ReLU()
+        if len(multipliers) == 1:
+            layers["ReLu" + str(len(multipliers) - 1)] = nn.ReLU()
         layers[str(len(multipliers))] = nn.Linear(
             int(multipliers[-1] * initial_features), n_components
         )
@@ -538,39 +582,47 @@ if __name__ == "__main__":
         help="Network multipliers",
         default="0.75 0.75 0.75",
     )
+    parser.add_argument("-variance_threshold", type=float, help="Variance threshold")
 
     args = parser.parse_args(
         [
             "tsne/colvar-ala1-wtm-tail.npy",
+            # "swiss_roll_2.txt",
             "-no_dims",
             "2",
             "-perplexity",
-            "250",
+            "100",
             "-step",
             "1",
             "-iter",
             "200",
             "-o",
-            "pytorch_results/ttt.txt",
-            "-model_save",
-            "pytorch_results/ttt.pth",
+            "pytorch_results/cala_treshold_normalization_standardization_kde_full.txt",
+            "-model_load",
+            "pytorch_results/cala_treshold_normalization_standardization_kde.pth",
             "-shuffle",
             "-kde_diff",
             "-jobs",
             "6",
             "-exclude_cols",
             "-1",
-            "-header",
+            # "-header",
             "-batch_size",
             "1000",
             "-net_multipliers",
             "0.8",
-            "1.5",
-            "1.7",
-            "0.9",
-            "1.2",
+            "0.75",
             "0.6",
-            "0.85",
+            "0.5",
+            "0.45",
+            # "1.5",
+            # "1.7",
+            # "0.9",
+            # "1.2",
+            # "0.6",
+            # "0.85",
+            "-variance_threshold",
+            "1e-4",
         ]
     )
 
@@ -588,10 +640,16 @@ if __name__ == "__main__":
         labels = load_labels(args.labels)
 
         if args.input_file.name.endswith(".npy"):
-            data = load_npy_file(args.input_file, args.step, args.exclude_cols)
+            data = load_npy_file(
+                args.input_file, args.step, args.exclude_cols, args.variance_threshold
+            )
         else:
             data = load_text_file(
-                args.input_file, args.step, args.header, args.exclude_cols
+                args.input_file,
+                args.step,
+                args.header,
+                args.exclude_cols,
+                args.variance_threshold,
             )
         shape = data.shape[1]
 
@@ -611,7 +669,7 @@ if __name__ == "__main__":
     )
 
     early_stopping = EarlyStopping(
-        "train_loss_epoch", min_delta=1e-4, patience=5, verbose=False
+        "train_loss_epoch", min_delta=1e-4, patience=3, verbose=False
     )
 
     is_gpu = tsne.device == torch.device("cuda:0")
