@@ -18,6 +18,41 @@ from typing import Tuple, Union
 import torchinfo
 
 
+def normalize_columns(data: torch.Tensor) -> torch.Tensor:
+    data_min = data.min(dim=0)[0]
+    data_range = data.max(dim=0)[0] - data_min
+    return (data - data_min) / data_range
+
+
+def filter_data_by_variance(
+    data: torch.Tensor, variance_threshold: float
+) -> Union[torch.Tensor, None]:
+    if variance_threshold is None:
+        return None
+    vars = data.var(axis=0)
+    cols = np.where(vars > variance_threshold)[0]
+    filtered_data = data[:, cols]
+    return filtered_data
+
+
+def save_means_and_vars(data: torch.Tensor, filtered_data: torch.Tensor = None) -> None:
+    means = data.mean(axis=0)
+    vars = data.var(axis=0)
+
+    if filtered_data is not None:
+        filtered_means = filtered_data.mean(axis=0)
+        filtered_vars = filtered_data.var(axis=0)
+
+    with open("means_and_vars.txt", "w") as f:
+        f.writelines("column\tmean\tvar\n")
+        for v in range(len(means)):
+            f.writelines(f"{v}\t{means[v]}\t{vars[v]}\n")
+        if filtered_data is not None:
+            f.writelines("\nfiltered_column\tfiltered_mean\tfiltered_var\n")
+            for v in range(len(filtered_means)):
+                f.writelines(f"{v}\t{filtered_means[v]}\t{filtered_vars[v]}\n")
+
+
 def load_torch_dataset(name: str, step: int, output: str) -> Tuple[Dataset, Dataset]:
     train, test = get_datasets.get_dataset(name)
     train = Subset(train, range(0, len(train), step))
@@ -26,14 +61,20 @@ def load_torch_dataset(name: str, step: int, output: str) -> Tuple[Dataset, Data
         for row in test:
             f.writelines(f"{row[1]}\n")
 
+    # get the train data to tensor from dataset
+    train_data = torch.stack([row[0] for row in train])
+    save_means_and_vars(train_data)
+
     return train, test
 
 
-def load_labels(labels: io.TextIOWrapper) -> Union[np.ndarray, None]:
+def load_labels(labels: io.TextIOWrapper) -> Union[torch.Tensor, None]:
+    read_labels = None
     if labels:
-        labels = np.loadtxt(args.labels)
+        read_labels = np.loadtxt(labels)
+        read_labels = torch.from_numpy(read_labels).float()
         labels.close()
-    return labels
+    return read_labels
 
 
 def load_text_file(
@@ -41,7 +82,7 @@ def load_text_file(
     step: int,
     header: bool,
     exclude_cols: list,
-    variance_treshold: float,
+    variance_threshold: float,
 ) -> torch.Tensor:
     cols = None
     if header:
@@ -59,23 +100,13 @@ def load_text_file(
 
     data = np.array(X[::step, :])
 
-    means = data.mean(axis=0)
-    vars = data.var(axis=0)
-
-    if variance_treshold:
-        cols = np.where(vars > variance_treshold)[0]
-        data = data[:, cols]
-
-    with open("means_and_vars.txt", "w") as f:
-        f.writelines("column\tmean\tvar\n")
-        for v in range(len(means)):
-            f.writelines(f"{v}\t{means[v]}\t{vars[v]}\n")
-
-    # data = (data - data.min()) / (data.max() - data.min())
+    filtered = filter_data_by_variance(data, variance_threshold)
+    save_means_and_vars(data, filtered)
+    if filtered is not None:
+        data = filtered
 
     data = torch.from_numpy(data).float()
-
-    # data = (data - data.mean(dim=0)) / data.std(dim=0)
+    data = normalize_columns(data)
 
     # for i in range(data.shape[1]):
     #     data[:, i] = (data[:, i] - data[:, i].min()) / (
@@ -89,7 +120,7 @@ def load_npy_file(
     input_file: io.TextIOWrapper,
     step: int,
     exclude_cols: list,
-    variance_treshold: float,
+    variance_threshold: float,
 ) -> torch.Tensor:
     name = input_file.name
     input_file.close()
@@ -99,28 +130,18 @@ def load_npy_file(
     if exclude_cols:
         data = np.delete(data, exclude_cols, axis=1)
 
-    means = data.mean(axis=0)
-    vars = data.var(axis=0)
-
-    if variance_treshold:
-        cols = np.where(vars > variance_treshold)[0]
-        data = data[:, cols]
-
-    with open("means_and_vars.txt", "w") as f:
-        f.writelines("column\tmean\tvar\n")
-        for v in range(len(means)):
-            f.writelines(f"{v}\t{means[v]}\t{vars[v]}\n")
-
-    # data = (data - data.min()) / (data.max() - data.min())
+    filtered = filter_data_by_variance(data, variance_threshold)
+    save_means_and_vars(data, filtered)
+    if filtered is not None:
+        data = filtered
 
     data = torch.from_numpy(data).float()
+    data = normalize_columns(data)
 
-    data = (data - data.mean(dim=0)) / data.std(dim=0)
-
-    for i in range(data.shape[1]):
-        data[:, i] = (data[:, i] - data[:, i].min()) / (
-            data[:, i].max() - data[:, i].min()
-        )
+    # for i in range(data.shape[1]):
+    #     data[:, i] = (data[:, i] - data[:, i].min()) / (
+    #         data[:, i].max() - data[:, i].min()
+    #     )
 
     return data
 
@@ -176,16 +197,18 @@ def x2p(
     D = torch.add(torch.add(-2 * torch.mm(X, X.mT), sum_X).T, sum_X)
 
     idx = (1 - torch.eye(n)).type(torch.bool)
-    D = D[idx].reshape((n, -1))
+    if not use_kde_diff:
+        D = D[idx].reshape((n, -1))
 
     P = torch.zeros(n, n, device=X.device)
 
     for i in range(n):
-        P[i, idx[i]] = (
-            x2p_job((i, D[i], logU), tolerance)[1]
-            if not use_kde_diff
-            else kde1d(D[i])[0]
-        )
+        if not use_kde_diff:
+            P[i, idx[i]] = x2p_job((i, D[i], logU), tolerance)[1]
+        else:
+            P[i, :] = torch.from_numpy(kde1d(D[i])[0]).float().to(X.device)
+    if use_kde_diff:
+        P = P * idx
     return P
 
 
@@ -194,9 +217,6 @@ class NeuralNetwork(nn.Module):
         self, initial_features: int, n_components: int, multipliers: list
     ) -> None:
         super(NeuralNetwork, self).__init__()
-        # feautures_multipliers = [1] * 3
-        # feautures_multipliers = [0.75, 0.6, 0.4]
-        # feautures_multipliers = [0.654] * 2
         layers = OrderedDict()
         layers["0"] = nn.Linear(
             initial_features, int(multipliers[0] * initial_features)
@@ -234,7 +254,6 @@ class ParametericTSNE:
         multipliers: list,
         n_jobs: int = 0,
         tolerance: float = 1e-5,
-        diffusion_scaling: bool = False,
         use_kde_diff: bool = False,
     ):
         self.device = (
@@ -261,7 +280,6 @@ class ParametericTSNE:
         self.n_jobs = n_jobs
         self.tolerance = tolerance
         self.max_iterations = max_iterations
-        self.diffusion_scaling = diffusion_scaling
         self.use_kde_diff = use_kde_diff
 
         self.loss_fn = self.set_loss_fn(loss_fn)
@@ -316,7 +334,7 @@ class ParametericTSNE:
                 batch_size=self.batch_size,
                 drop_last=True,
                 pin_memory=True,
-                # num_workers=self.n_jobs,
+                num_workers=self.n_jobs if self.device == "cpu" else 0,
             )
             if train is not None
             else None
@@ -327,7 +345,7 @@ class ParametericTSNE:
                 batch_size=self.batch_size,
                 drop_last=True,
                 pin_memory=True,
-                # num_workers=self.n_jobs,
+                num_workers=self.n_jobs if self.device == "cpu" else 0,
             )
             if test is not None
             else None
@@ -342,9 +360,8 @@ class ParametericTSNE:
         ):
             batch = x2p(X, self.perplexity, self.tolerance, self.use_kde_diff)
             batch[torch.isnan(batch)] = 0
-            batch = batch + batch.T
+            batch = batch + batch.mT
             batch = batch / batch.sum()
-            batch = batch if not self.diffusion_scaling else self._scale_P(batch)
             batch = torch.maximum(
                 batch.to(self.device), torch.tensor([1e-12], device=self.device)
             )
@@ -362,16 +379,6 @@ class ParametericTSNE:
         C = torch.log((P + eps) / (Q + eps))
         C = torch.sum(P * C)
         return C
-
-    def _scale_P(self, data: torch.Tensor) -> torch.Tensor:
-        scaled_data = torch.zeros(data.shape, device=self.device)
-        bandwidths = [kde1d(row)[2] for row in data]
-
-        bandwidth_sum = sum(bandwidths)
-        for i, row in enumerate(data):
-            scaled_data[i] = row / bandwidth_sum * bandwidths[i] * len(data)
-
-        return scaled_data
 
     def _adjust_size(self, X, y=None):
         if X.shape[0] % self.batch_size != 0:
@@ -586,43 +593,47 @@ if __name__ == "__main__":
 
     args = parser.parse_args(
         [
-            "tsne/colvar-ala1-wtm-tail.npy",
-            # "swiss_roll_2.txt",
+            # "tsne/colvar-ala1-wtm-tail.npy",
+            # "swiss_roll_data.txt",
+            "mnist",
             "-no_dims",
             "2",
+            # "-labels",
+            # "swiss_roll_colors.txt",
             "-perplexity",
-            "100",
+            "60",
             "-step",
             "1",
             "-iter",
             "200",
             "-o",
-            "pytorch_results/cala_treshold_normalization_standardization_kde_full.txt",
-            "-model_load",
-            "pytorch_results/cala_treshold_normalization_standardization_kde.pth",
+            "pytorch_results/test_mnist2.txt",
+            "-model_save",
+            "pytorch_results/test_mnist2.pth",
             "-shuffle",
-            "-kde_diff",
+            # "-kde_diff",
             "-jobs",
             "6",
-            "-exclude_cols",
-            "-1",
+            # "-exclude_cols",
+            # "-1",
             # "-header",
             "-batch_size",
-            "1000",
+            "1024",
             "-net_multipliers",
+            "1",
             "0.8",
             "0.75",
             "0.6",
-            "0.5",
-            "0.45",
+            # "0.5",
+            # "0.45",
             # "1.5",
             # "1.7",
             # "0.9",
             # "1.2",
             # "0.6",
             # "0.85",
-            "-variance_threshold",
-            "1e-4",
+            # "-variance_threshold",
+            # "1e-4",
         ]
     )
 
@@ -664,8 +675,7 @@ if __name__ == "__main__":
         shape,
         args.net_multipliers,
         args.jobs,
-        False,
-        args.kde_diff,
+        use_kde_diff=args.kde_diff,
     )
 
     early_stopping = EarlyStopping(
@@ -686,7 +696,7 @@ if __name__ == "__main__":
     if args.model_load:
         tsne.read_model(args.model_load)
         train, test = (
-            tsne.split_dataset(data, test_size=1)
+            tsne.split_dataset(data, y=labels, test_size=1)
             if not skip_loading_data
             else tsne.create_dataloaders(train, test)
         )
@@ -699,7 +709,7 @@ if __name__ == "__main__":
         else:
             train_size = 0.8
         train, test = (
-            tsne.split_dataset(data, train_size=train_size)
+            tsne.split_dataset(data, y=labels, train_size=train_size)
             if not skip_loading_data
             else tsne.create_dataloaders(train, test)
         )
