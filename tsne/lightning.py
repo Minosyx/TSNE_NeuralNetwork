@@ -18,6 +18,10 @@ from typing import Tuple, Union
 import torchinfo
 
 
+def is_power_of_2(n: int) -> bool:
+    return (n & (n - 1) == 0) and n != 0
+
+
 def normalize_columns(data: torch.Tensor) -> torch.Tensor:
     data_min = data.min(dim=0)[0]
     data_range = data.max(dim=0)[0] - data_min
@@ -61,7 +65,6 @@ def load_torch_dataset(name: str, step: int, output: str) -> Tuple[Dataset, Data
         for row in test:
             f.writelines(f"{row[1]}\n")
 
-    # get the train data to tensor from dataset
     train_data = torch.stack([row[0] for row in train])
     save_means_and_vars(train_data)
 
@@ -206,7 +209,7 @@ def x2p(
         if not use_kde_diff:
             P[i, idx[i]] = x2p_job((i, D[i], logU), tolerance)[1]
         else:
-            P[i, :] = torch.from_numpy(kde1d(D[i])[0]).float().to(X.device)
+            P[i, :] = torch.from_numpy(kde1d(D[i], n)[0]).float().to(X.device)
     if use_kde_diff:
         P = P * idx
     return P
@@ -255,10 +258,12 @@ class ParametericTSNE:
         n_jobs: int = 0,
         tolerance: float = 1e-5,
         use_kde_diff: bool = False,
+        force_cpu: bool = False,
     ):
-        self.device = (
-            torch.device("cuda:0") if torch.cuda.is_available() else torch.device("cpu")
-        )
+        if force_cpu or not torch.cuda.is_available():
+            self.device = torch.device("cpu")
+        elif torch.cuda.is_available():
+            self.device = torch.device("cuda:0")
         self.model = NeuralNetwork(features, n_components, multipliers).to(self.device)
         torchinfo.summary(
             self.model,
@@ -590,32 +595,39 @@ if __name__ == "__main__":
         default="0.75 0.75 0.75",
     )
     parser.add_argument("-variance_threshold", type=float, help="Variance threshold")
+    parser.add_argument("-cpu", action="store_true", help="Use CPU")
+    parser.add_argument(
+        "-early_stopping_delta", type=float, help="Early stopping delta", default=1e-4
+    )
+    parser.add_argument(
+        "-early_stopping_patience", type=int, help="Early stopping patience", default=3
+    )
 
     args = parser.parse_args(
         [
-            # "tsne/colvar-ala1-wtm-tail.npy",
+            "tsne/colvar-ala1-wtm-tail.npy",
             # "swiss_roll_data.txt",
-            "mnist",
+            # "mnist",
             "-no_dims",
             "2",
             # "-labels",
             # "swiss_roll_colors.txt",
             "-perplexity",
-            "60",
+            "100",
             "-step",
             "1",
             "-iter",
             "200",
             "-o",
-            "pytorch_results/test_mnist2.txt",
-            "-model_save",
-            "pytorch_results/test_mnist2.pth",
+            "pytorch_results/n_colvar_full.txt",
+            "-model_load",
+            "pytorch_results/n_colvar.pth",
             "-shuffle",
             # "-kde_diff",
             "-jobs",
             "6",
-            # "-exclude_cols",
-            # "-1",
+            "-exclude_cols",
+            "-1",
             # "-header",
             "-batch_size",
             "1024",
@@ -632,10 +644,13 @@ if __name__ == "__main__":
             # "1.2",
             # "0.6",
             # "0.85",
-            # "-variance_threshold",
-            # "1e-4",
+            "-variance_threshold",
+            "1e-4",
         ]
     )
+
+    if args.kde_diff and not is_power_of_2(args.batch_size):
+        raise ValueError("Batch size should be a power of 2 when using kde_diff")
 
     skip_loading_data = False
     if (
@@ -676,10 +691,14 @@ if __name__ == "__main__":
         args.net_multipliers,
         args.jobs,
         use_kde_diff=args.kde_diff,
+        force_cpu=args.cpu,
     )
 
     early_stopping = EarlyStopping(
-        "train_loss_epoch", min_delta=1e-4, patience=3, verbose=False
+        "train_loss_epoch",
+        min_delta=args.early_stopping_delta,
+        patience=args.early_stopping_patience,
+        verbose=False,
     )
 
     is_gpu = tsne.device == torch.device("cuda:0")
