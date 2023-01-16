@@ -200,8 +200,8 @@ def x2p(
     D = torch.add(torch.add(-2 * torch.mm(X, X.mT), sum_X).T, sum_X)
 
     idx = (1 - torch.eye(n)).type(torch.bool)
-    if not use_kde_diff:
-        D = D[idx].reshape((n, -1))
+    # if not use_kde_diff:
+    D = D[idx].reshape((n, -1))
 
     P = torch.zeros(n, n, device=X.device)
 
@@ -209,7 +209,14 @@ def x2p(
         if not use_kde_diff:
             P[i, idx[i]] = x2p_job((i, D[i], logU), tolerance)[1]
         else:
-            P[i, :] = torch.from_numpy(kde1d(D[i], n)[0]).float().to(X.device)
+            density = kde1d(D[i], n)[0]
+            # with open("density.txt", "a") as f:
+            #     for number in density:
+            #         f.write(str(number) + " ")
+            #     f.write("\n")
+            density = torch.from_numpy(density).float().to(X.device)
+            normalized_density = density / torch.sum(density)
+            P[i, :] = normalized_density
     if use_kde_diff:
         P = P * idx
     return P
@@ -365,8 +372,9 @@ class ParametericTSNE:
         ):
             batch = x2p(X, self.perplexity, self.tolerance, self.use_kde_diff)
             batch[torch.isnan(batch)] = 0
-            batch = batch + batch.mT
-            batch = batch / batch.sum()
+            if not self.use_kde_diff:
+                batch = batch + batch.mT
+                batch = batch / batch.sum()
             batch = torch.maximum(
                 batch.to(self.device), torch.tensor([1e-12], device=self.device)
             )
@@ -511,13 +519,6 @@ if __name__ == "__main__":
         "-no_dims", type=int, help="Number of dimensions", required=True, default=2
     )
     parser.add_argument(
-        "-start_dims",
-        type=int,
-        help="Number of dimensions to start with after initial reduction using PCA",
-        required=False,
-        default=0,
-    )
-    parser.add_argument(
         "-perplexity",
         type=float,
         help="Perplexity of the Gaussian kernel",
@@ -592,12 +593,12 @@ if __name__ == "__main__":
         type=float,
         nargs="+",
         help="Network multipliers",
-        default="0.75 0.75 0.75",
+        default=[0.75, 0.75, 0.75],
     )
     parser.add_argument("-variance_threshold", type=float, help="Variance threshold")
     parser.add_argument("-cpu", action="store_true", help="Use CPU")
     parser.add_argument(
-        "-early_stopping_delta", type=float, help="Early stopping delta", default=1e-4
+        "-early_stopping_delta", type=float, help="Early stopping delta", default=1e-5
     )
     parser.add_argument(
         "-early_stopping_patience", type=int, help="Early stopping patience", default=3
@@ -605,38 +606,44 @@ if __name__ == "__main__":
 
     args = parser.parse_args(
         [
-            "tsne/colvar-ala1-wtm-tail.npy",
-            # "swiss_roll_data.txt",
-            # "mnist",
+            # "tsne/colvar-ala1-wtm-tail.npy",
+            # "swiss_roll_2.txt",
+            "fashion_mnist",
             "-no_dims",
             "2",
             # "-labels",
             # "swiss_roll_colors.txt",
             "-perplexity",
-            "100",
+            "30",
             "-step",
             "1",
             "-iter",
-            "200",
+            "1000",
             "-o",
-            "pytorch_results/n_colvar_full.txt",
-            "-model_load",
-            "pytorch_results/n_colvar.pth",
+            "praca/fmnist.txt",
+            "-model_save",
+            "praca/fmnist.pth",
             "-shuffle",
             # "-kde_diff",
             "-jobs",
             "6",
-            "-exclude_cols",
-            "-1",
+            # "-exclude_cols",
+            # "-1",
             # "-header",
             "-batch_size",
             "1024",
+            # "-train_size",
+            # "1",
             "-net_multipliers",
+            # "1",
+            "2",
+            "3",
+            "2",
             "1",
             "0.8",
             "0.75",
             "0.6",
-            # "0.5",
+            "0.5",
             # "0.45",
             # "1.5",
             # "1.7",
@@ -644,8 +651,8 @@ if __name__ == "__main__":
             # "1.2",
             # "0.6",
             # "0.85",
-            "-variance_threshold",
-            "1e-4",
+            # "-variance_threshold",
+            # "1e-4",
         ]
     )
 
@@ -735,10 +742,12 @@ if __name__ == "__main__":
         trainer.fit(classifier, train)
         if args.model_save:
             tsne.save_model(args.model_save)
-        Y = trainer.predict(classifier, test)
+        if test is not None:
+            Y = trainer.predict(classifier, test)
 
-    with open(args.o, "w") as f:
-        f.writelines(f"{args.step}\n")
-        for i, batch in tqdm(enumerate(Y), unit="samples", total=(len(Y))):
-            for px, py in batch:
-                f.writelines(f"{px}\t{py}\n")
+    if test is not None:
+        with open(args.o, "w") as f:
+            f.writelines(f"{args.step}\n")
+            for i, batch in tqdm(enumerate(Y), unit="samples", total=(len(Y))):
+                for px, py in batch:
+                    f.writelines(f"{px}\t{py}\n")
