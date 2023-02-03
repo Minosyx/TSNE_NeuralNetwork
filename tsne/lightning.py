@@ -14,12 +14,17 @@ from tqdm import tqdm
 from kde1d import kde1d
 import get_datasets
 import sys
-from typing import Tuple, Union
+from typing import Any, List, Tuple, Union
 import torchinfo
+import torch.multiprocessing as mp
 
 
 def is_power_of_2(n: int) -> bool:
     return (n & (n - 1) == 0) and n != 0
+
+
+def does_sum_up_to(a: float, b: float, to: float, epsilon=1e-7):
+    return abs(a + b - to) < epsilon
 
 
 def normalize_columns(data: torch.Tensor) -> torch.Tensor:
@@ -61,14 +66,17 @@ def load_torch_dataset(name: str, step: int, output: str) -> Tuple[Dataset, Data
     train, test = get_datasets.get_dataset(name)
     train = Subset(train, range(0, len(train), step))
 
-    with open(output.rsplit("/", maxsplit=1)[0] + "/" + name + "_cols.txt", "w") as f:
-        for row in test:
-            f.writelines(f"{row[1]}\n")
-
+    save_torch_labels(name, output, test)
     train_data = torch.stack([row[0] for row in train])
     save_means_and_vars(train_data)
 
     return train, test
+
+
+def save_torch_labels(name: str, output: str, test: Dataset) -> None:
+    with open(output.rsplit("/", maxsplit=1)[0] + "/" + name + "_labels.txt", "w") as f:
+        for row in test:
+            f.writelines(f"{row[1]}\n")
 
 
 def load_labels(labels: io.TextIOWrapper) -> Union[torch.Tensor, None]:
@@ -102,19 +110,7 @@ def load_text_file(
     input_file.close()
 
     data = np.array(X[::step, :])
-
-    filtered = filter_data_by_variance(data, variance_threshold)
-    save_means_and_vars(data, filtered)
-    if filtered is not None:
-        data = filtered
-
-    data = torch.from_numpy(data).float()
-    data = normalize_columns(data)
-
-    # for i in range(data.shape[1]):
-    #     data[:, i] = (data[:, i] - data[:, i].min()) / (
-    #         data[:, i].max() - data[:, i].min()
-    #     )
+    data = prepare_data(variance_threshold, data)
 
     return data
 
@@ -128,11 +124,16 @@ def load_npy_file(
     name = input_file.name
     input_file.close()
     data = np.load(name)
-    cols = data.shape[1]
     data = data[::step, :]
     if exclude_cols:
         data = np.delete(data, exclude_cols, axis=1)
 
+    data = prepare_data(variance_threshold, data)
+
+    return data
+
+
+def prepare_data(variance_threshold: float, data: np.ndarray) -> torch.Tensor:
     filtered = filter_data_by_variance(data, variance_threshold)
     save_means_and_vars(data, filtered)
     if filtered is not None:
@@ -140,12 +141,6 @@ def load_npy_file(
 
     data = torch.from_numpy(data).float()
     data = normalize_columns(data)
-
-    # for i in range(data.shape[1]):
-    #     data[:, i] = (data[:, i] - data[:, i].min()) / (
-    #         data[:, i].max() - data[:, i].min()
-    #     )
-
     return data
 
 
@@ -192,6 +187,7 @@ def x2p(
     perplexity: int,
     tolerance: float,
     use_kde_diff: bool,
+    n_jobs: int,
 ) -> torch.Tensor:
     n = X.shape[0]
     logU = torch.log(torch.tensor([perplexity], device=X.device))
@@ -204,6 +200,14 @@ def x2p(
     D = D[idx].reshape((n, -1))
 
     P = torch.zeros(n, n, device=X.device)
+
+    # with mp.Pool(n_jobs) as pool:
+    #     results = pool.starmap(
+    #         x2p_job, [((i, D[i], logU), tolerance) for i in range(n)]
+    #     )
+
+    # for i, res in enumerate(results):
+    #     P[i, idx[i]] = res[1]
 
     for i in range(n):
         if not use_kde_diff:
@@ -250,7 +254,7 @@ class NeuralNetwork(nn.Module):
         return logits
 
 
-class ParametericTSNE:
+class ParametricTSNE:
     def __init__(
         self,
         loss_fn,
@@ -313,16 +317,7 @@ class ParametericTSNE:
         train_size: float = None,
         test_size: float = None,
     ) -> Tuple[DataLoader, DataLoader]:
-        if train_size is None and test_size is None:
-            train_size = 0.8
-            test_size = 1 - train_size
-        elif train_size is None:
-            train_size = 1 - test_size
-        elif test_size is None:
-            test_size = 1 - train_size
-
-        # X, y = self._adjust_size(X, y)
-
+        train_size, test_size = self._determine_train_test_split(train_size, test_size)
         if y is None:
             dataset = TensorDataset(X)
         else:
@@ -337,6 +332,20 @@ class ParametericTSNE:
 
         return self.create_dataloaders(train_dataset, test_dataset)
 
+    def _determine_train_test_split(
+        self, train_size: float, test_size: float
+    ) -> Tuple[float, float]:
+        if train_size is None and test_size is None:
+            train_size = 0.8
+            test_size = 1 - train_size
+        elif train_size is None:
+            train_size = 1 - test_size
+        elif test_size is None:
+            test_size = 1 - train_size
+        elif not does_sum_up_to(train_size, test_size, 1):
+            test_size = 1 - train_size
+        return train_size, test_size
+
     def create_dataloaders(
         self, train: Dataset, test: Dataset
     ) -> Tuple[DataLoader, DataLoader]:
@@ -345,7 +354,7 @@ class ParametericTSNE:
                 train,
                 batch_size=self.batch_size,
                 drop_last=True,
-                pin_memory=True,
+                pin_memory=False if self.device == "cpu" else True,
                 num_workers=self.n_jobs if self.device == "cpu" else 0,
             )
             if train is not None
@@ -356,7 +365,7 @@ class ParametericTSNE:
                 test,
                 batch_size=self.batch_size,
                 drop_last=True,
-                pin_memory=True,
+                pin_memory=False if self.device == "cpu" else True,
                 num_workers=self.n_jobs if self.device == "cpu" else 0,
             )
             if test is not None
@@ -364,13 +373,15 @@ class ParametericTSNE:
         )
         return train_loader, test_loader
 
-    def _calculate_P(self, dataloader: torch.utils.data.DataLoader) -> torch.Tensor:
+    def _calculate_P(self, dataloader: DataLoader) -> torch.Tensor:
         n = len(dataloader.dataset)
         P = torch.zeros((n, self.batch_size), device=self.device)
         for i, (X, *_) in tqdm(
             enumerate(dataloader), unit="batch", total=len(dataloader)
         ):
-            batch = x2p(X, self.perplexity, self.tolerance, self.use_kde_diff)
+            batch = x2p(
+                X, self.perplexity, self.tolerance, self.use_kde_diff, self.n_jobs
+            )
             batch[torch.isnan(batch)] = 0
             if not self.use_kde_diff:
                 batch = batch + batch.mT
@@ -380,6 +391,50 @@ class ParametericTSNE:
             )
             P[i * self.batch_size : (i + 1) * self.batch_size] = batch
         return P
+
+    # def _calculate_P(self, dataloader: DataLoader) -> torch.Tensor:
+    #     n = len(dataloader.dataset)
+    #     P = torch.zeros((n, self.batch_size), device=self.device)
+
+    #     batches = [
+    #         (
+    #             X.to(self.device),
+    #             self.perplexity,
+    #             self.tolerance,
+    #             self.use_kde_diff,
+    #             self.n_jobs,
+    #             i * self.batch_size,
+    #         )
+    #         for i, (X, *_) in enumerate(dataloader)
+    #     ]
+
+    #     with mp.Pool(self.n_jobs) as pool:
+    #         with tqdm(total=len(batches), unit="batch") as pbar:
+    #             results = [
+    #                 pool.apply_async(
+    #                     self.calculate_batch,
+    #                     args=(batch,),
+    #                     callback=lambda x: pbar.update(1),
+    #                 )
+    #                 for batch in batches
+    #             ]
+    #             results = [result.get() for result in results]
+
+    #     for i, batch in results:
+    #         batch[torch.isnan(batch)] = 0
+    #         if not self.use_kde_diff:
+    #             batch = batch + batch.mT
+    #             batch = batch / batch.sum()
+    #         batch = torch.maximum(
+    #             batch.to(self.device), torch.tensor([1e-12], device=self.device)
+    #         )
+    #         P[i : i + self.batch_size] = batch
+    #     return P
+
+    # def calculate_batch(self, inputs: List):
+    #     X, perplexity, tolerance, use_kde_diff, n_jobs, i = inputs
+    #     batch = x2p(X, perplexity, tolerance, use_kde_diff, n_jobs)
+    #     return (i, batch)
 
     def _kl_divergence(self, Y: torch.Tensor, P: torch.Tensor) -> torch.Tensor:
         sum_Y = torch.sum(torch.square(Y), dim=1)
@@ -405,7 +460,7 @@ class ParametericTSNE:
 class Classifier(pl.LightningModule):
     def __init__(
         self,
-        tsne: ParametericTSNE,
+        tsne: ParametricTSNE,
         shuffle: bool,
         optimizer: str = "adam",
         lr: float = 1e-3,
@@ -420,10 +475,20 @@ class Classifier(pl.LightningModule):
         self.shuffle = shuffle
         self.lr = lr
         self.optimizer = optimizer
+        self.reset_exaggeration_status()
 
-    def training_step(self, batch, batch_idx):
+    def reset_exaggeration_status(self):
+        self.has_exaggeration_ended = True if self.exaggeration_epochs == 0 else False
+
+    def training_step(
+        self,
+        batch: Union[
+            torch.Tensor, Tuple[torch.Tensor, ...], List[Union[torch.Tensor, Any]]
+        ],
+        batch_idx: int,
+    ):
         x = batch[0]
-        _P_batch = self.P_copy[
+        _P_batch = self.P_current[
             batch_idx * self.batch_size : (batch_idx + 1) * self.batch_size
         ]
 
@@ -440,7 +505,9 @@ class Classifier(pl.LightningModule):
         )
         return {"loss": loss}
 
-    def _set_optimizer(self, optimizer: str, optimizer_params: dict):
+    def _set_optimizer(
+        self, optimizer: str, optimizer_params: dict
+    ) -> torch.optim.Optimizer:
         if optimizer == "adam":
             return optim.Adam(self.model.parameters(), **optimizer_params)
         elif optimizer == "sgd":
@@ -450,22 +517,31 @@ class Classifier(pl.LightningModule):
         else:
             raise ValueError("Unknown optimizer")
 
-    def configure_optimizers(self):
+    def configure_optimizers(self) -> torch.optim.Optimizer:
         return self._set_optimizer(self.optimizer, {"lr": self.lr})
 
     def on_train_start(self) -> None:
-        self.P = self.tsne._calculate_P(self.trainer.train_dataloader)
+        if not hasattr(self, "P"):
+            self.P = self.tsne._calculate_P(self.trainer.train_dataloader)
 
     def on_train_epoch_start(self) -> None:
-        self.P_copy = self.P.clone()
+        if self.current_epoch > 0 and self.has_exaggeration_ended:
+            return
         if (
             self.exaggeration_epochs > 0
             and self.current_epoch < self.exaggeration_epochs
         ):
-            self.P_copy *= self.exaggeration_value
+            if not hasattr(self, "P_multiplied"):
+                self.P_multiplied = self.P.clone()
+                self.P_multiplied *= self.exaggeration_value
+            self.P_current = self.P_multiplied
+        else:
+            self.P_current = self.P
+            self.has_exaggeration_ended = True
 
     def on_train_epoch_end(self) -> None:
-        del self.P_copy
+        if hasattr(self, "P_multiplied") and self.has_exaggeration_ended:
+            del self.P_multiplied
 
     def predict_step(self, batch, batch_idx, dataloader_idx=None):
         return self.model(batch[0])
@@ -483,7 +559,7 @@ class FileTypeWithExtensionCheck(argparse.FileType):
         return super().__call__(string)
 
 
-class FileTypeWithExtensionCheckPredefined(FileTypeWithExtensionCheck):
+class FileTypeWithExtensionCheckWithPredefinedDatasets(FileTypeWithExtensionCheck):
     def __call__(self, string):
         if len(available_datasets) > 0 and string in available_datasets:
             return string
@@ -493,15 +569,27 @@ class FileTypeWithExtensionCheckPredefined(FileTypeWithExtensionCheck):
         return super().__call__(string)
 
 
+def save_results(
+    args: argparse.Namespace, test: DataLoader, Y: Union[List[Any], List[List[Any]]]
+):
+    if test is not None:
+        with open(args.o, "w") as f:
+            f.writelines(f"{args.step}\n")
+            for i, batch in tqdm(enumerate(Y), unit="samples", total=(len(Y))):
+                for px, py in batch:
+                    f.writelines(f"{px}\t{py}\n")
+
+
 if __name__ == "__main__":
+
     if "get_datasets" in sys.modules:
         global available_datasets
-        available_datasets = get_datasets.get_available_datasets()
+        available_datasets = get_datasets._get_available_datasets()
 
     parser = argparse.ArgumentParser(description="t-SNE Algorithm")
     parser.add_argument(
         "input_file",
-        type=FileTypeWithExtensionCheckPredefined(
+        type=FileTypeWithExtensionCheckWithPredefinedDatasets(
             valid_extensions=("txt", "data", "npy")
         ),
         help="Input file",
@@ -603,37 +691,43 @@ if __name__ == "__main__":
     parser.add_argument(
         "-early_stopping_patience", type=int, help="Early stopping patience", default=3
     )
+    parser.add_argument("-lr", type=float, help="Learning rate", default=1e-3)
+    parser.add_argument("-auto_lr", action="store_true", help="Auto learning rate")
 
     args = parser.parse_args(
         [
             # "tsne/colvar-ala1-wtm-tail.npy",
             # "swiss_roll_2.txt",
-            "fashion_mnist",
+            "mnist",
+            # "tsne/colvar-tf.data",
             "-no_dims",
             "2",
             # "-labels",
             # "swiss_roll_colors.txt",
             "-perplexity",
-            "30",
+            "50",
             "-step",
             "1",
             "-iter",
             "1000",
             "-o",
-            "praca/fmnist.txt",
+            "praca/mnist__www.txt",
             "-model_save",
-            "praca/fmnist.pth",
+            "praca/mnist__www.pth",
             "-shuffle",
             # "-kde_diff",
             "-jobs",
             "6",
             # "-exclude_cols",
+            # "0",
             # "-1",
             # "-header",
             "-batch_size",
             "1024",
-            # "-train_size",
-            # "1",
+            "-train_size",
+            "0.7",
+            "-test_size",
+            "0.5",
             "-net_multipliers",
             # "1",
             "2",
@@ -653,23 +747,29 @@ if __name__ == "__main__":
             # "0.85",
             # "-variance_threshold",
             # "1e-4",
+            "-auto_lr",
+            # "-exaggeration_iter",
+            # "30",
+            # "-exaggeration_value",
+            # "12",
         ]
     )
+
+    mp.set_start_method("spawn")
 
     if args.kde_diff and not is_power_of_2(args.batch_size):
         raise ValueError("Batch size should be a power of 2 when using kde_diff")
 
-    skip_loading_data = False
+    skip_data_splitting = False
     if (
         not isinstance(args.input_file, io.TextIOWrapper)
         and len(available_datasets) > 0
         and (name := args.input_file.lower()) in available_datasets
     ):
         train, test = load_torch_dataset(name, args.step, args.o)
-        skip_loading_data = True
-        shape = np.prod(train.dataset.data.shape[1:])
-
-    if not skip_loading_data:
+        skip_data_splitting = True
+        features = np.prod(train.dataset.data.shape[1:])
+    else:
         labels = load_labels(args.labels)
 
         if args.input_file.name.endswith(".npy"):
@@ -684,19 +784,19 @@ if __name__ == "__main__":
                 args.exclude_cols,
                 args.variance_threshold,
             )
-        shape = data.shape[1]
+        features = data.shape[1]
 
-    tsne = ParametericTSNE(
-        "kl_divergence",
-        args.no_dims,
-        args.perplexity,
-        args.batch_size,
-        args.exaggeration_iter,
-        args.exaggeration_value,
-        args.iter,
-        shape,
-        args.net_multipliers,
-        args.jobs,
+    tsne = ParametricTSNE(
+        loss_fn="kl_divergence",
+        n_components=args.no_dims,
+        perplexity=args.perplexity,
+        batch_size=args.batch_size,
+        early_exaggeration_epochs=args.exaggeration_iter,
+        early_exaggeration_value=args.exaggeration_value,
+        max_iterations=args.iter,
+        features=features,
+        multipliers=args.net_multipliers,
+        n_jobs=args.jobs,
         use_kde_diff=args.kde_diff,
         force_cpu=args.cpu,
     )
@@ -705,7 +805,6 @@ if __name__ == "__main__":
         "train_loss_epoch",
         min_delta=args.early_stopping_delta,
         patience=args.early_stopping_patience,
-        verbose=False,
     )
 
     is_gpu = tsne.device == torch.device("cuda:0")
@@ -713,41 +812,35 @@ if __name__ == "__main__":
         accelerator="gpu" if is_gpu else "cpu",
         devices=1 if is_gpu else tsne.n_jobs,
         log_every_n_steps=1,
-        max_epochs=args.iter,
+        max_epochs=tsne.max_iterations,
         callbacks=[early_stopping],
-        auto_lr_find=True,
+        auto_lr_find=True if args.auto_lr else False,
     )
-    classifier = Classifier(tsne, args.shuffle)
+    classifier = Classifier(tsne, args.shuffle, lr=args.lr)
 
     if args.model_load:
         tsne.read_model(args.model_load)
         train, test = (
             tsne.split_dataset(data, y=labels, test_size=1)
-            if not skip_loading_data
+            if not skip_data_splitting
             else tsne.create_dataloaders(train, test)
         )
         Y = trainer.predict(classifier, test)
     else:
-        if args.train_size is not None:
-            train_size = args.train_size
-        elif args.test_size is not None:
-            train_size = 1 - args.test_size
-        else:
-            train_size = 0.8
         train, test = (
-            tsne.split_dataset(data, y=labels, train_size=train_size)
-            if not skip_loading_data
+            tsne.split_dataset(
+                data, y=labels, train_size=args.train_size, test_size=args.test_size
+            )
+            if not skip_data_splitting
             else tsne.create_dataloaders(train, test)
         )
+        if args.auto_lr:
+            trainer.tune(classifier, train)
+            classifier.reset_exaggeration_status()
         trainer.fit(classifier, train)
         if args.model_save:
             tsne.save_model(args.model_save)
         if test is not None:
             Y = trainer.predict(classifier, test)
 
-    if test is not None:
-        with open(args.o, "w") as f:
-            f.writelines(f"{args.step}\n")
-            for i, batch in tqdm(enumerate(Y), unit="samples", total=(len(Y))):
-                for px, py in batch:
-                    f.writelines(f"{px}\t{py}\n")
+    save_results(args, test, Y)

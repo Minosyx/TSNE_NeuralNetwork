@@ -42,9 +42,8 @@ def get_fashion_mnist() -> Tuple[Dataset, Dataset]:
     return fashion_mnist_dataset_train, fashion_mnist_dataset_test
 
 
-def get_available_datasets() -> List[str]:
+def _get_available_datasets() -> List[str]:
     methods = [key[4:] for key in globals().keys() if key.startswith("get")]
-    methods.remove("available_datasets")
     methods.remove("dataset")
     return methods
 
@@ -65,6 +64,6 @@ def prepare_dataset(dataset_name: str) -> Tuple[Dataset, Dataset]:
 
 def get_dataset(dataset_name: str) -> Tuple[Dataset, Dataset]:
     name = dataset_name.lower()
-    if name in get_available_datasets():
+    if name in _get_available_datasets():
         return prepare_dataset(name)
     return None, None
