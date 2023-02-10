@@ -16,7 +16,6 @@ import get_datasets
 import sys
 from typing import Any, List, Tuple, Union
 import torchinfo
-import torch.multiprocessing as mp
 
 
 def is_power_of_2(n: int) -> bool:
@@ -377,7 +376,10 @@ class ParametricTSNE:
         n = len(dataloader.dataset)
         P = torch.zeros((n, self.batch_size), device=self.device)
         for i, (X, *_) in tqdm(
-            enumerate(dataloader), unit="batch", total=len(dataloader)
+            enumerate(dataloader),
+            unit="batch",
+            total=len(dataloader),
+            desc="Calculating P",
         ):
             batch = x2p(
                 X, self.perplexity, self.tolerance, self.use_kde_diff, self.n_jobs
@@ -575,9 +577,33 @@ def save_results(
     if test is not None:
         with open(args.o, "w") as f:
             f.writelines(f"{args.step}\n")
-            for i, batch in tqdm(enumerate(Y), unit="samples", total=(len(Y))):
+            for i, batch in tqdm(
+                enumerate(Y), unit="samples", total=(len(Y)), desc="Saving results"
+            ):
                 for px, py in batch:
                     f.writelines(f"{px}\t{py}\n")
+
+
+def save_test_data(
+    args: argparse.Namespace,
+    test: DataLoader,
+):
+    if test is not None:
+        new_name = args.o.rsplit(".", 1)[0] + "_test.txt"
+        with open(new_name, "w") as f:
+            for i, batch in tqdm(
+                enumerate(test),
+                unit="samples",
+                total=(len(test)),
+                desc="Saving test data",
+            ):
+                for samples in batch:
+                    samples = samples.tolist()
+                    for sample in samples:
+                        for col in sample:
+                            f.write(str(col))
+                            f.write("\t")
+                        f.write("\n")
 
 
 if __name__ == "__main__":
@@ -697,23 +723,23 @@ if __name__ == "__main__":
     args = parser.parse_args(
         [
             # "tsne/colvar-ala1-wtm-tail.npy",
-            # "swiss_roll_2.txt",
-            "mnist",
+            "swiss_roll_2.txt",
+            # "fashion_mnist",
             # "tsne/colvar-tf.data",
             "-no_dims",
             "2",
             # "-labels",
             # "swiss_roll_colors.txt",
             "-perplexity",
-            "50",
+            "5",
             "-step",
             "1",
             "-iter",
             "1000",
             "-o",
-            "praca/mnist__www.txt",
+            "praca/rollo__5perp1000_full.txt",
             "-model_save",
-            "praca/mnist__www.pth",
+            "praca/rollo__5perp1000.pth",
             "-shuffle",
             # "-kde_diff",
             "-jobs",
@@ -723,21 +749,21 @@ if __name__ == "__main__":
             # "-1",
             # "-header",
             "-batch_size",
-            "1024",
-            "-train_size",
-            "0.7",
-            "-test_size",
-            "0.5",
+            "1000",
+            # "-train_size",
+            # "0.7",
+            # "-test_size",
+            # "0.5",
             "-net_multipliers",
-            # "1",
+            "1",
             "2",
             "3",
             "2",
             "1",
-            "0.8",
-            "0.75",
-            "0.6",
-            "0.5",
+            # "0.8",
+            # "0.75",
+            # "0.6",
+            # "0.5",
             # "0.45",
             # "1.5",
             # "1.7",
@@ -747,15 +773,13 @@ if __name__ == "__main__":
             # "0.85",
             # "-variance_threshold",
             # "1e-4",
-            "-auto_lr",
+            # "-auto_lr",
             # "-exaggeration_iter",
-            # "30",
+            # "5",
             # "-exaggeration_value",
             # "12",
         ]
     )
-
-    mp.set_start_method("spawn")
 
     if args.kde_diff and not is_power_of_2(args.batch_size):
         raise ValueError("Batch size should be a power of 2 when using kde_diff")
@@ -825,6 +849,8 @@ if __name__ == "__main__":
             if not skip_data_splitting
             else tsne.create_dataloaders(train, test)
         )
+        if not skip_data_splitting:
+            save_test_data(args, test)
         Y = trainer.predict(classifier, test)
     else:
         train, test = (
@@ -834,6 +860,8 @@ if __name__ == "__main__":
             if not skip_data_splitting
             else tsne.create_dataloaders(train, test)
         )
+        if not skip_data_splitting:
+            save_test_data(args, test)
         if args.auto_lr:
             trainer.tune(classifier, train)
             classifier.reset_exaggeration_status()
