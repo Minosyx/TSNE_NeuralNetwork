@@ -60,16 +60,21 @@ def load_torch_dataset(name: str, step: int, output: str) -> Tuple[Dataset, Data
     train, test = get_datasets.get_dataset(name)
     train = Subset(train, range(0, len(train), step))
 
-    save_torch_labels(name, output, test)
+    save_torch_labels(output, test)
     train_data = torch.stack([row[0] for row in train])
     save_means_and_vars(train_data)
 
     return train, test
 
 
-def save_torch_labels(name: str, output: str, test: Dataset) -> None:
-    with open(output.rsplit("/", maxsplit=1)[0] + "/" + name + "_labels.txt", "w") as f:
-        for row in test:
+def save_torch_labels(output: str, test: Dataset) -> None:
+    with open(
+        output.rsplit(".", maxsplit=1)[0] + "_labels.txt",
+        "w",
+    ) as f:
+        for i, row in tqdm(
+            enumerate(test), unit="samples", total=len(test), desc="Saving labels"
+        ):
             f.writelines(f"{row[1]}\n")
 
 
@@ -333,7 +338,7 @@ class ParametricTSNE:
             DataLoader(
                 test,
                 batch_size=self.batch_size,
-                drop_last=True,
+                drop_last=False,
                 pin_memory=False if self.device == "cpu" else True,
                 num_workers=self.n_jobs if self.device == "cpu" else 0,
             )
@@ -508,7 +513,7 @@ def save_labels_data(
         with open(new_name, "w") as f:
             for i, batch in tqdm(
                 enumerate(test),
-                unit="samples",
+                unit="batches",
                 total=(len(test)),
                 desc="Saving new labels",
             ):

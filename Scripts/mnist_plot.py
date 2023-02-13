@@ -52,7 +52,7 @@ if __name__ == "__main__":
         labels = np.loadtxt(args.labels)
         args.labels.close()
 
-    if f:
+    if args.f:
         classes = [
             "T-shirt/top",
             "Trouser",
@@ -71,7 +71,7 @@ if __name__ == "__main__":
     fig, ax = plt.subplots(1, 1)
 
     sns.scatterplot(
-        x=data[:, 0], y=data[:, 1], hue=labels[: len(data)], palette="Spectral"
+        x=data[:, 0], y=data[:, 1], hue=labels[: len(data)], palette="Paired"
     )
     plt.xlabel("t-SNE 1")
     plt.ylabel("t-SNE 2")
@@ -79,5 +79,5 @@ if __name__ == "__main__":
 
     new_name = args.input_file.rsplit(".", 1)[0] + ".png"
 
-    plt.savefig(new_name, dpi=500)
+    plt.savefig(new_name)
     plt.show()

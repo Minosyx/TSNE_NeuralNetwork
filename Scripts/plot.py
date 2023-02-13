@@ -32,6 +32,7 @@ if __name__ == "__main__":
         "-alpha", type=float, help="Alpha of point", required=False, default=1
     )
     parser.add_argument("-neural_labels", action="store_true", help="Neural labels")
+    parser.add_argument("-marker_size", type=int, help="Marker size", default=15)
 
     args = parser.parse_args()
 
@@ -55,13 +56,13 @@ if __name__ == "__main__":
     plt.scatter(
         data[:: args.step, 0],
         data[:: args.step, 1],
-        15,
+        args.marker_size,
         alpha=args.alpha,
         marker=".",
     ) if labels is None else plt.scatter(
         data[:: args.step, 0],
         data[:: args.step, 1],
-        15,
+        args.marker_size,
         labels[:: step * args.step] if not args.neural_labels else labels[:: args.step],
         alpha=args.alpha,
         marker=".",
@@ -71,5 +72,5 @@ if __name__ == "__main__":
     plt.xlabel("t-SNE 1")
 
     new_name = args.input_file.rsplit(".", 1)[0] + ".png"
-    plt.savefig(new_name, dpi=500)
+    plt.savefig(new_name)
     plt.show()
