@@ -13,11 +13,11 @@ from torch.utils.data import DataLoader, Dataset, TensorDataset, random_split, S
 from tqdm import tqdm
 import get_datasets
 import sys
-from typing import Any, List, Tuple, Union
+from typing import Any, Callable, List, Tuple, Union
 import torchinfo
 
 
-def does_sum_up_to(a: float, b: float, to: float, epsilon=1e-7):
+def does_sum_up_to(a: float, b: float, to: float, epsilon=1e-7) -> bool:
     return abs(a + b - to) < epsilon
 
 
@@ -91,7 +91,7 @@ def load_text_file(
     input_file: io.TextIOWrapper,
     step: int,
     header: bool,
-    exclude_cols: list,
+    exclude_cols: List[int],
     variance_threshold: float,
 ) -> torch.Tensor:
     cols = None
@@ -117,7 +117,7 @@ def load_text_file(
 def load_npy_file(
     input_file: io.TextIOWrapper,
     step: int,
-    exclude_cols: list,
+    exclude_cols: List[int],
     variance_threshold: float,
 ) -> torch.Tensor:
     name = input_file.name
@@ -143,7 +143,7 @@ def prepare_data(variance_threshold: float, data: np.ndarray) -> torch.Tensor:
     return data
 
 
-def Hbeta(D: torch.Tensor, beta: float) -> tuple:
+def Hbeta(D: torch.Tensor, beta: float) -> Tuple[torch.Tensor, torch.Tensor]:
     P = torch.exp(-D * beta)
     sumP = torch.sum(P)
     H = torch.log(sumP) + beta * torch.sum(D * P) / sumP
@@ -151,7 +151,11 @@ def Hbeta(D: torch.Tensor, beta: float) -> tuple:
     return H, P
 
 
-def x2p_job(data: tuple, tolerance: float, max_iterations: int = 50) -> tuple:
+def x2p_job(
+    data: Tuple[int, torch.Tensor, torch.Tensor],
+    tolerance: float,
+    max_iterations: int = 50,
+) -> Tuple[int, torch.Tensor]:
     i, Di, logU = data
     beta = 1.0
     beta_min = -torch.inf
@@ -204,7 +208,7 @@ def x2p(
 
 class NeuralNetwork(nn.Module):
     def __init__(
-        self, initial_features: int, n_components: int, multipliers: list
+        self, initial_features: int, n_components: int, multipliers: List[float]
     ) -> None:
         super(NeuralNetwork, self).__init__()
         layers = OrderedDict()
@@ -233,7 +237,7 @@ class NeuralNetwork(nn.Module):
 class ParametricTSNE:
     def __init__(
         self,
-        loss_fn,
+        loss_fn: str,
         n_components: int,
         perplexity: int,
         batch_size: int,
@@ -241,7 +245,7 @@ class ParametricTSNE:
         early_exaggeration_value: float,
         max_iterations: int,
         features: int,
-        multipliers: list,
+        multipliers: List[float],
         n_jobs: int = 0,
         tolerance: float = 1e-5,
         force_cpu: bool = False,
@@ -274,7 +278,7 @@ class ParametricTSNE:
 
         self.loss_fn = self.set_loss_fn(loss_fn)
 
-    def set_loss_fn(self, loss_fn):
+    def set_loss_fn(self, loss_fn) -> Callable:
         if loss_fn == "kl_divergence":
             return self._kl_divergence
 
@@ -290,7 +294,7 @@ class ParametricTSNE:
         y: torch.Tensor = None,
         train_size: float = None,
         test_size: float = None,
-    ) -> Tuple[DataLoader, DataLoader]:
+    ) -> Tuple[Union[DataLoader, None], Union[DataLoader, None]]:
         train_size, test_size = self._determine_train_test_split(train_size, test_size)
         if y is None:
             dataset = TensorDataset(X)
@@ -322,7 +326,7 @@ class ParametricTSNE:
 
     def create_dataloaders(
         self, train: Dataset, test: Dataset
-    ) -> Tuple[DataLoader, DataLoader]:
+    ) -> Tuple[Union[DataLoader, None], Union[DataLoader, None]]:
         train_loader = (
             DataLoader(
                 train,

@@ -31,7 +31,9 @@ if __name__ == "__main__":
     parser.add_argument(
         "-alpha", type=float, help="Alpha of point", required=False, default=1
     )
-    parser.add_argument("-neural_labels", action="store_true", help="Neural labels")
+    parser.add_argument(
+        "-neural_labels", action="store_true", help="Labels obtained from neural t-SNE"
+    )
     parser.add_argument("-marker_size", type=int, help="Marker size", default=15)
 
     args = parser.parse_args()
@@ -42,8 +44,6 @@ if __name__ == "__main__":
     with open(args.input_file, "r") as f:
         step = int(f.readline())
         data = np.loadtxt(f)
-
-    dims = len(data.shape)
 
     fig, ax = plt.subplots(1, 1)
 

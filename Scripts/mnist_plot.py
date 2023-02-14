@@ -45,8 +45,6 @@ if __name__ == "__main__":
         step = int(f.readline())
         data = np.loadtxt(f)
 
-    dims = len(data.shape)
-
     labels = None
     if args.labels:
         labels = np.loadtxt(args.labels)
