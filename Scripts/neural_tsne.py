@@ -502,7 +502,7 @@ def save_results(
         with open(args.o, "w") as f:
             f.writelines(f"{args.step}\n")
             for i, batch in tqdm(
-                enumerate(Y), unit="samples", total=(len(Y)), desc="Saving results"
+                enumerate(Y), unit="batches", total=(len(Y)), desc="Saving results"
             ):
                 for px, py in batch:
                     f.writelines(f"{px}\t{py}\n")
